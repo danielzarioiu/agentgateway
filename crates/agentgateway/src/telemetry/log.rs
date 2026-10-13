@@ -3743,6 +3743,7 @@ mod tests {
 		);
 	}
 
+	#[test]
 	fn llm_span_uses_cache_inclusive_input_tokens() {
 		let request = llm::LLMRequest {
 			input_tokens: None,
@@ -3818,6 +3819,78 @@ mod tests {
 			Some(&opentelemetry::Value::I64(4))
 		);
 	}
+
+	/// The Bedrock Converse path (Accounting consumer: synapse-runtime
+	/// accounting-tap → canonical usage_attempt) MUST emit the same
+	/// cache-INCLUSIVE canonical input: Converse reports `inputTokens`
+	/// EXCLUDING `cacheReadInputTokens`/`cacheWriteInputTokens`, and the
+	/// accounting settlement subtracts the cache dimensions from the canonical
+	/// meter — an exclusive emission would double-subtract cached tokens and
+	/// under-meter every cached Converse attempt.
+	#[test]
+	fn llm_span_uses_cache_inclusive_input_tokens_for_bedrock_converse() {
+		let request = llm::LLMRequest {
+			input_tokens: None,
+			input_format: InputFormat::Messages,
+			cache_convention: llm::CacheTokenConvention::InputExcludesCache,
+			request_model: strng::literal!("global.openai.gpt-6-luna"),
+			provider: strng::literal!("bedrock"),
+			streaming: false,
+			params: llm::LLMRequestParams::default(),
+			prompt: None,
+			provider_state: None,
+		};
+		// Converse-shaped evidence: inputTokens=50 excludes the cache dims.
+		let response = llm::LLMResponse {
+			input_tokens: Some(50),
+			cached_input_tokens: Some(40),
+			cache_creation_input_tokens: Some(10),
+			output_tokens: Some(20),
+			total_tokens: Some(70),
+			..Default::default()
+		};
+
+		let (tracer, exporter) = test_tracer();
+		let mut log = test_request_log();
+		log.tracer = Some(tracer.clone());
+		let mut outgoing = trc::TraceParent::new();
+		outgoing.flags = 1;
+		log.outgoing_span = Some(outgoing);
+		log.llm_request = Some(request.clone());
+		log
+			.llm_response
+			.store(Some(llm::LLMInfo::new(request, response)));
+
+		drop(DropOnLog::from(log));
+		let _ = tracer.provider.force_flush();
+
+		let spans = exporter.finished_spans();
+		let span = spans
+			.iter()
+			.find(|span| span.name.as_ref() == "unknown")
+			.expect("request span should be exported");
+		let value = |key: &str| {
+			span
+				.attributes
+				.iter()
+				.find(|attr| attr.key.as_str() == key)
+				.map(|attr| &attr.value)
+		};
+		// 50 + 40 + 10 — the canonical meter must INCLUDE the cache dims.
+		assert_eq!(
+			value("gen_ai.usage.input_tokens"),
+			Some(&opentelemetry::Value::I64(100))
+		);
+		assert_eq!(
+			value("gen_ai.usage.cache_read.input_tokens"),
+			Some(&opentelemetry::Value::I64(40))
+		);
+		assert_eq!(
+			value("gen_ai.usage.cache_creation.input_tokens"),
+			Some(&opentelemetry::Value::I64(10))
+		);
+	}
+
 
 	#[test]
 	fn llm_span_usage_completeness_follows_the_evidence() {
