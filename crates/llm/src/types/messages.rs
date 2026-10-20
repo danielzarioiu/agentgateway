@@ -48,6 +48,37 @@ impl Request {
 					.is_some_and(content_references_deferred_tool)
 			})
 	}
+
+	/// Downgrade this request's Tool Search (deferred tool loading) shapes to
+	/// ordinary upfront-tool-loading inference: drop every `tool_search*`
+	/// server tool from `tools` and strip `defer_loading` flags from the
+	/// remaining (real) tool definitions, which stay fully declared — only
+	/// their context-deferral hint is removed. Conversation history is left
+	/// untouched: a transcript that already carries `tool_reference` blocks
+	/// genuinely depends on deferred-tool semantics, and rewriting it would
+	/// corrupt the conversation — such requests stay `uses_native_tool_search
+	/// == true` after this call (callers re-check) and keep the
+	/// Anthropic-compatible-only guard. Callers must also drop the
+	/// tool-search `anthropic-beta` header values from the forwarded request.
+	pub fn downgrade_tool_search(&mut self) {
+		let Some(tools) = self.rest.get_mut("tools").and_then(|t| t.as_array_mut()) else {
+			return;
+		};
+		// A no-op when no tool_search tool is offered: the retain keeps every
+		// entry and only the defer_loading strip runs (harmless on tools that
+		// never carried the flag).
+		tools.retain(|tool| {
+			tool
+				.get("type")
+				.and_then(serde_json::Value::as_str)
+				.is_none_or(|tool_type| !tool_type.starts_with("tool_search"))
+		});
+		for tool in tools.iter_mut() {
+			if let Some(object) = tool.as_object_mut() {
+				object.remove("defer_loading");
+			}
+		}
+	}
 }
 
 /// A `tools` array (raw JSON from the passthrough `rest` field) offering any
@@ -1777,5 +1808,71 @@ mod tests {
 	#[test]
 	fn text_only_conversation_has_no_native_tool_search() {
 		assert!(!parse_request(toolsearch_body_base()).uses_native_tool_search());
+	}
+
+	#[test]
+	fn downgrade_strips_tool_search_tool_and_defer_flags() {
+		let mut body = toolsearch_body_base();
+		body["tools"] = serde_json::json!([
+			{"type": "tool_search_tool_regex_20250922", "name": "tool_search"},
+			{
+				"name": "get_weather",
+				"description": "Get the weather",
+				"input_schema": {"type": "object"},
+				"defer_loading": true
+			},
+			{
+				"name": "convert_currency",
+				"description": "Convert",
+				"input_schema": {"type": "object"},
+				"defer_loading": true
+			}
+		]);
+		let mut req = parse_request(body);
+		assert!(req.uses_native_tool_search());
+		req.downgrade_tool_search();
+		assert!(
+			!req.uses_native_tool_search(),
+			"fully downgraded request must no longer count as native Tool Search"
+		);
+		let tools = req.rest["tools"].as_array().unwrap();
+		assert_eq!(tools.len(), 2, "only the real tools remain: {tools:?}");
+		assert!(
+			tools.iter().all(|t| !t.get("defer_loading").is_some()),
+			"defer_loading flags must be stripped so tools load upfront: {tools:?}"
+		);
+		assert!(tools[0]["name"].as_str() == Some("get_weather"));
+	}
+
+	#[test]
+	fn downgrade_without_tools_array_is_a_no_op() {
+		let mut req = parse_request(toolsearch_body_base());
+		req.downgrade_tool_search();
+		assert!(!req.uses_native_tool_search());
+	}
+
+	#[test]
+	fn downgrade_never_rewrites_tool_reference_history() {
+		// A transcript that already depends on deferred-tool semantics stays
+		// native Tool Search after the downgrade attempt: rewriting history
+		// would corrupt the conversation, so such requests keep the strict
+		// Anthropic-compatible-only guard.
+		let body = serde_json::json!({
+			"model": "claude-sonnet-4-5",
+			"max_tokens": 64,
+			"messages": [
+				{"role": "user", "content": "list the widgets"},
+				{"role": "assistant", "content": [
+					{"type": "tool_reference", "tool_name": "mcp__example__list_widgets"}
+				]}
+			],
+			"tools": [{"type": "tool_search_tool_regex_20250922"}]
+		});
+		let mut req = parse_request(body);
+		req.downgrade_tool_search();
+		assert!(
+			req.uses_native_tool_search(),
+			"tool_reference history keeps the request native after downgrade"
+		);
 	}
 }
