@@ -637,7 +637,7 @@ async fn evaluate_classifies_via_mock_and_records_metrics() {
 	assert_eq!(
 		available(&results)["toolu_1"],
 		ToolUseVerdict::flagged(
-			"[Destructive operation] The action was not explicitly requested by the user in this context."
+			"[Destructive operation] The action was not requested by the user in this context."
 		)
 	);
 	assert_eq!(mock.calls(), 1);

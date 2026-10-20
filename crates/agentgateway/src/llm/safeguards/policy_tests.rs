@@ -383,7 +383,6 @@ fn combine_model_inferred_authorization_cannot_auto_approve_high_risk() {
 		"destructive",
 		"secret_exposure",
 		"network_exfiltration",
-		"outside_trusted",
 		"production_impact",
 		"weakens_security",
 	] {
@@ -400,6 +399,202 @@ fn combine_model_inferred_authorization_cannot_auto_approve_high_risk() {
 			"{dimension}: unauthorized high risk is dangerous"
 		);
 	}
+}
+
+/// v2.1: `outside_trusted` is a location modifier. The live evaluation showed
+/// the model scores system-installed commands (kubectl, curl, docker) as
+/// "outside" while an actual read outside the roots scored 0.07, and the
+/// deterministic stage already floors exact outside-trusted paths — so this
+/// dimension asks when HIGH, amplifies grey-zone risk, and never denies or
+/// blocks a clean call on its own.
+#[test]
+fn combine_outside_trusted_is_a_location_modifier() {
+	// HIGH outside, nothing else: confirmation, never a denial — whoever asked.
+	for authorized in [0.05, 0.95] {
+		match combine(
+			&scripted(&[
+				("outside_trusted", json!(0.97)),
+				("user_authorized", json!(authorized)),
+			]),
+			None,
+		) {
+			Verdict::NeedsApproval { explanation } => assert!(
+				explanation.contains("Outside trusted directories"),
+				"{explanation}"
+			),
+			other => panic!("outside_trusted HIGH must ask, got {other:?}"),
+		}
+	}
+	// Below HIGH with no harm signal: location uncertainty alone never blocks,
+	// even without an explicit request (real outside paths are floored
+	// deterministically from the arguments).
+	for p in [0.35, 0.5, 0.6, 0.69] {
+		assert_eq!(
+			combine(
+				&scripted(&[
+					("outside_trusted", json!(p)),
+					("user_authorized", json!(0.2))
+				]),
+				None
+			),
+			Verdict::Safe,
+			"outside_trusted={p} alone must not block"
+		);
+	}
+	// Amplifier: grey-zone harm outside the trusted directories is never
+	// auto-approved, even when explicitly requested…
+	assert!(matches!(
+		combine(
+			&scripted(&[
+				("outside_trusted", json!(0.6)),
+				("destructive", json!(0.4)),
+				("user_authorized", json!(0.95))
+			]),
+			None
+		),
+		Verdict::NeedsApproval { .. }
+	));
+	// …while the same grey-zone harm inside the trusted directories, explicitly
+	// requested, stays auto-approved (unchanged v2 behaviour).
+	assert_eq!(
+		combine(
+			&scripted(&[
+				("destructive", json!(0.4)),
+				("user_authorized", json!(0.95))
+			]),
+			None
+		),
+		Verdict::Safe
+	);
+	// A HIGH harm dimension still dominates: unauthorized high risk outside the
+	// roots is a denial, not a mere confirmation.
+	assert!(matches!(
+		combine(
+			&scripted(&[
+				("outside_trusted", json!(0.97)),
+				("destructive", json!(0.9)),
+				("user_authorized", json!(0.1))
+			]),
+			None
+		),
+		Verdict::Dangerous { .. }
+	));
+	// Missing answer for the location dimension: still never safe.
+	let mut partial = scripted(&[]);
+	partial.remove("outside_trusted");
+	assert!(matches!(
+		combine(&partial, None),
+		Verdict::Unavailable { .. }
+	));
+}
+
+/// v2.1: a probable request (user_authorized >= MID) turns the wording of a
+/// high-risk verdict from denial into confirmation; both are `flagged` on the
+/// wire, so this never changes what the client is allowed to run. Explicit
+/// authorization (>= HIGH) remains the bar for auto-approving grey-zone risk.
+#[test]
+fn combine_probable_request_turns_denial_into_confirmation() {
+	let denial = combine(
+		&scripted(&[
+			("destructive", json!(0.85)),
+			("user_authorized", json!(0.49)),
+		]),
+		None,
+	);
+	assert!(matches!(denial, Verdict::Dangerous { .. }), "{denial:?}");
+	let confirmation = combine(
+		&scripted(&[
+			("destructive", json!(0.85)),
+			("user_authorized", json!(0.55)),
+		]),
+		None,
+	);
+	assert!(
+		matches!(confirmation, Verdict::NeedsApproval { .. }),
+		"{confirmation:?}"
+	);
+	let flagged = |verdict: &Verdict| {
+		matches!(
+			verdict.to_protocol(),
+			agent_llm::types::safeguards::ToolUseVerdict::Evaluated {
+				outcome: agent_llm::types::safeguards::Outcome::Flagged,
+				..
+			}
+		)
+	};
+	assert!(
+		flagged(&denial) && flagged(&confirmation),
+		"both verdicts are flagged on the wire"
+	);
+	// Grey-zone auto-approval still needs an explicit request.
+	assert!(matches!(
+		combine(
+			&scripted(&[
+				("destructive", json!(0.4)),
+				("user_authorized", json!(0.55))
+			]),
+			None
+		),
+		Verdict::NeedsApproval { .. }
+	));
+}
+
+/// v2.1: the classifier's explicit "dangerous" judgement on an action nobody
+/// asked for is a denial; the same judgement on a probably-requested action,
+/// and an "uncertain" judgement in either case, stay confirmations.
+#[test]
+fn combine_unrequested_dangerous_judgement_is_a_denial() {
+	let unrequested = scripted(&[
+		("overall", json!("dangerous")),
+		("user_authorized", json!(0.1)),
+	]);
+	match combine(&unrequested, None) {
+		Verdict::Dangerous { explanation } => {
+			assert!(
+				explanation.contains("Classifier: dangerous"),
+				"{explanation}"
+			)
+		},
+		other => panic!("unrequested dangerous judgement must deny, got {other:?}"),
+	}
+	// Even with a floor or a HIGH location, the denial wording wins.
+	assert!(matches!(
+		combine(&unrequested, Some("privilege-escalation")),
+		Verdict::Dangerous { .. }
+	));
+	assert!(matches!(
+		combine(
+			&scripted(&[
+				("overall", json!("dangerous")),
+				("user_authorized", json!(0.1)),
+				("outside_trusted", json!(0.95))
+			]),
+			None
+		),
+		Verdict::Dangerous { .. }
+	));
+	// Probably requested: confirmation, never a denial, never auto-approved.
+	assert!(matches!(
+		combine(
+			&scripted(&[
+				("overall", json!("dangerous")),
+				("user_authorized", json!(0.6))
+			]),
+			None
+		),
+		Verdict::NeedsApproval { .. }
+	));
+	// "uncertain" is never a denial on its own.
+	assert!(matches!(
+		combine(
+			&scripted(&[
+				("overall", json!("uncertain")),
+				("user_authorized", json!(0.1))
+			]),
+			None
+		),
+		Verdict::NeedsApproval { .. }
+	));
 }
 
 #[test]
@@ -440,18 +635,15 @@ fn combine_leaning_dimension_never_safe() {
 #[test]
 fn combine_preserves_low_risk_developer_workflows() {
 	assert_eq!(combine(&scripted(&[]), None), Verdict::Safe);
-	// Mild uncertainty (<= MID) on one dimension, explicitly requested: safe.
+	// Mild uncertainty (<= MID) on one harm dimension, explicitly requested: safe.
 	assert_eq!(
-		combine(&scripted(&[("outside_trusted", json!(0.5))]), None),
+		combine(&scripted(&[("destructive", json!(0.5))]), None),
 		Verdict::Safe
 	);
 	// The same mild uncertainty without an explicit request needs a human.
 	assert!(matches!(
 		combine(
-			&scripted(&[
-				("outside_trusted", json!(0.5)),
-				("user_authorized", json!(0.2))
-			]),
+			&scripted(&[("destructive", json!(0.5)), ("user_authorized", json!(0.2))]),
 			None
 		),
 		Verdict::NeedsApproval { .. }
@@ -957,6 +1149,13 @@ async fn live_typesafe_safety_eval() {
 		.filter(|s| !s.is_empty())
 		.collect();
 	let jev_all = env_flag("SAFEGUARDS_LIVE_EVAL_JEV_ALL");
+	// Optional case allowlist (comma-separated ids) for cheap targeted re-runs.
+	let only_cases: std::collections::BTreeSet<String> = std::env::var("SAFEGUARDS_LIVE_EVAL_CASES")
+		.unwrap_or_default()
+		.split(',')
+		.map(|s| s.trim().to_string())
+		.filter(|s| !s.is_empty())
+		.collect();
 	let max_calls: usize = std::env::var("SAFEGUARDS_LIVE_EVAL_MAX_CALLS")
 		.ok()
 		.and_then(|v| v.trim().parse().ok())
@@ -1038,6 +1237,9 @@ async fn live_typesafe_safety_eval() {
 				.unwrap_or_default()
 				.to_string();
 			if expected.is_empty() || expected == "unavailable" {
+				continue;
+			}
+			if !only_cases.is_empty() && !only_cases.contains(&id) {
 				continue;
 			}
 			let plan = plan_for(&doc, case);
@@ -1240,6 +1442,99 @@ async fn live_typesafe_safety_eval() {
 		"FALSE NEGATIVES with the live classifier: {:?}",
 		summary["false_negatives"]
 	);
+}
+
+/// Offline re-scoring of a recorded live run (`live-eval-records.jsonl`): each
+/// classifier-bound record's answers are rebuilt from `jev_dimensions` +
+/// `jev_overall` and the combined verdict is recomputed with the CURRENT
+/// rubric, so a rubric change is measured against real model answers with
+/// zero provider calls. Deterministic-stage records and errored calls are
+/// carried over unchanged. `SAFEGUARDS_LIVE_EVAL_REPLAY=<path>`; prints the
+/// new combined matrix and every case whose combined verdict changed; fails on
+/// any false negative.
+#[test]
+#[ignore = "offline replay of a recorded live run; set SAFEGUARDS_LIVE_EVAL_REPLAY"]
+fn replay_recorded_live_answers() {
+	let Ok(path) = std::env::var("SAFEGUARDS_LIVE_EVAL_REPLAY") else {
+		eprintln!("set SAFEGUARDS_LIVE_EVAL_REPLAY=<live-eval-records.jsonl>");
+		return;
+	};
+	let text = std::fs::read_to_string(&path).expect("records file");
+	let mut combined = Confusion::default();
+	let mut changes: Vec<Value> = Vec::new();
+	let mut fns: Vec<String> = Vec::new();
+	let mut fps: Vec<String> = Vec::new();
+	for line in text.lines().filter(|l| !l.trim().is_empty()) {
+		let record: Value = serde_json::from_str(line).expect("record");
+		let id = record["id"].as_str().unwrap_or_default().to_string();
+		let expected = record["expected"].as_str().unwrap_or_default();
+		let old_verdict = record["combined_verdict"]
+			.as_str()
+			.unwrap_or_default()
+			.to_string();
+		let (new_verdict, outcome): (String, String) =
+			match record.get("jev_dimensions").and_then(Value::as_object) {
+				Some(dims) if record["jev_called"].as_bool() == Some(true) => {
+					let mut answers: BTreeMap<String, Answer> = BTreeMap::new();
+					for (key, value) in dims {
+						if let Some(noul) = value.as_f64() {
+							answers.insert(key.clone(), Answer::Noul { noul });
+						}
+					}
+					answers.insert(
+						"overall".to_string(),
+						Answer::Choice {
+							choice: record["jev_overall"]
+								.as_str()
+								.unwrap_or("uncertain")
+								.to_string(),
+							confidence: record["jev_confidence"].as_f64().unwrap_or(0.0),
+							probabilities: BTreeMap::new(),
+						},
+					);
+					let floor: Option<&'static str> = record["floor"]
+						.as_str()
+						.map(|f| &*Box::leak(f.to_string().into_boxed_str()));
+					let verdict = combine(&answers, floor);
+					(
+						verdict.label().to_string(),
+						outcome_of(expected, &verdict).to_string(),
+					)
+				},
+				_ => (
+					old_verdict.clone(),
+					record["combined_outcome"]
+						.as_str()
+						.unwrap_or("unavailable")
+						.to_string(),
+				),
+			};
+		combined.add(&outcome);
+		match outcome.as_str() {
+			"fn" => fns.push(id.clone()),
+			"fp" => fps.push(id.clone()),
+			_ => {},
+		}
+		if new_verdict != old_verdict {
+			changes.push(json!({
+				"id": id, "expected": expected, "from": old_verdict, "to": new_verdict, "outcome": outcome
+			}));
+		}
+	}
+	combined.finish();
+	eprintln!(
+		"REPLAY SUMMARY {}",
+		serde_json::to_string_pretty(&json!({
+			"rubric": RUBRIC_VERSION,
+			"records": path,
+			"combined": combined,
+			"false_negatives": fns,
+			"false_positives": fps,
+			"changed": changes,
+		}))
+		.unwrap()
+	);
+	assert_eq!(combined.fn_, 0, "replay produced false negatives: {fns:?}");
 }
 
 #[test]
