@@ -429,6 +429,50 @@ fn review_plan_debug_is_redacted_and_exposes_trusted_dirs() {
 	);
 }
 
+/// The object-form `trusted_directories` the real Claude Code 2.1.304 client
+/// sends (captured 2026-10-20 in the isolated container E2E; synthetic /work
+/// paths). The parser must accept it next to the plain-array form: dropping
+/// `additional` roots would wrongly treat trusted paths as outside-trusted.
+#[test]
+fn trusted_directories_object_form_from_real_client() {
+	let rest = request_rest(json!({
+		"permission_mode": "auto",
+		"platform": "linux",
+		"live_cwd": "/work",
+		"home_dir": "/root",
+		"trusted_directories": {
+			"primary": {"path": "/work", "resolved": ["/work"]},
+			"additional": [{"path": "/work/extra", "resolved": ["/work/extra"]}],
+			"network": [],
+			"block_reads_outside_working_directories": false
+		}
+	}));
+	let safeguards = requested_dangerous_tool_use(&rest).unwrap();
+	let plan = SafeguardsReviewPlan::from_request(
+		"claude-sonnet-5-5",
+		&json!([{"role": "user", "content": "list files"}]),
+		&safeguards,
+	);
+	assert_eq!(
+		plan.trusted_directories(),
+		vec!["/work", "/work/extra"],
+		"primary plus additional roots, deduplicated, live_cwd not duplicated"
+	);
+
+	// Legacy array form still works, and a string-form additional entry too.
+	let rest = request_rest(json!({
+		"live_cwd": "/a",
+		"trusted_directories": {"primary": "/b", "additional": ["/c"]}
+	}));
+	let safeguards = requested_dangerous_tool_use(&rest).unwrap();
+	let plan = SafeguardsReviewPlan::from_request(
+		"claude-sonnet-5-5",
+		&json!([{"role": "user", "content": "x"}]),
+		&safeguards,
+	);
+	assert_eq!(plan.trusted_directories(), vec!["/b", "/c", "/a"]);
+}
+
 #[test]
 fn clipping_respects_char_boundaries() {
 	let text = "héllo wörld";

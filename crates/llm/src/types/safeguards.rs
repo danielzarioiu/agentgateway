@@ -620,20 +620,33 @@ impl SafeguardsReviewPlan {
 	}
 
 	/// Trusted directories from the classifier context (`live_cwd` is included
-	/// as a trusted root when present), for deterministic path rules.
+	/// as a trusted root when present), for deterministic path rules. Two wire
+	/// shapes are accepted: a plain array of paths, and the object form the
+	/// real Claude Code 2.1.304 client sends —
+	/// `{"primary":{"path":…,"resolved":[…]},"additional":[…],"network":[…]}` —
+	/// where the `primary`/`additional` entries are either paths or
+	/// `{path, resolved}` objects.
 	pub fn trusted_directories(&self) -> Vec<String> {
-		let mut dirs: Vec<String> = self
-			.classifier_context
-			.get("trusted_directories")
-			.and_then(Value::as_array)
-			.map(|items| {
-				items
-					.iter()
-					.filter_map(Value::as_str)
-					.map(str::to_string)
-					.collect()
-			})
-			.unwrap_or_default();
+		let mut dirs: Vec<String> = Vec::new();
+		match self.classifier_context.get("trusted_directories") {
+			Some(Value::Array(items)) => {
+				dirs.extend(items.iter().filter_map(Value::as_str).map(str::to_string));
+			},
+			Some(Value::Object(map)) => {
+				for group in ["primary", "additional"] {
+					match map.get(group) {
+						Some(Value::Array(items)) => {
+							for entry in items {
+								collect_trusted_entry(entry, &mut dirs);
+							}
+						},
+						Some(entry) => collect_trusted_entry(entry, &mut dirs),
+						None => {},
+					}
+				}
+			},
+			_ => {},
+		}
 		if let Some(cwd) = self
 			.classifier_context
 			.get("live_cwd")
@@ -642,6 +655,8 @@ impl SafeguardsReviewPlan {
 		{
 			dirs.push(cwd.to_string());
 		}
+		let mut seen = std::collections::HashSet::new();
+		dirs.retain(|dir| seen.insert(dir.clone()));
 		dirs
 	}
 
@@ -650,6 +665,28 @@ impl SafeguardsReviewPlan {
 			.classifier_context
 			.get("permission_mode")
 			.and_then(Value::as_str)
+	}
+}
+
+/// One `primary`/`additional` entry of the object-form `trusted_directories`:
+/// either a path or a `{path, resolved}` object.
+fn collect_trusted_entry(entry: &Value, out: &mut Vec<String>) {
+	match entry {
+		Value::String(path) => out.push(path.clone()),
+		Value::Object(map) => {
+			if let Some(path) = map.get("path").and_then(Value::as_str) {
+				out.push(path.to_string());
+			}
+			if let Some(resolved) = map.get("resolved").and_then(Value::as_array) {
+				out.extend(
+					resolved
+						.iter()
+						.filter_map(Value::as_str)
+						.map(str::to_string),
+				);
+			}
+		},
+		_ => {},
 	}
 }
 
