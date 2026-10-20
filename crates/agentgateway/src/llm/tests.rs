@@ -4530,19 +4530,18 @@ async fn unverified_model_toolsearch_is_downgraded_to_ordinary_tools() {
 	// The allowlist names a DIFFERENT model: this one's Tool Search shapes must
 	// be downgraded before routing, so the request converts cleanly to OpenAI
 	// (failover stays available) with the tool_search server tool gone,
-	// defer_loading stripped, and the tool-search betas dropped while other
-	// betas survive.
+	// defer_loading stripped, the tool_reference history rewritten to its
+	// eager equivalent, and the tool-search betas dropped while other betas
+	// survive. The body keeps the 2026-10-20 Claude Desktop shape: a
+	// tool_reference part in an assistant turn after tool use.
 	let _env = ScopedToolSearchEnv::allow("claude-sonnet-5-5").await;
 	let provider = AIProvider::OpenAI(openai::Provider {
 		model_override: None,
 		moderation: None,
 	});
-	let mut body = toolsearch_body("gpt-4o", false);
-	// No tool_reference history: the downgrade must fully apply.
-	body["messages"] = json!([{"role": "user", "content": "find a tool for that"}]);
 	let result = process_toolsearch_messages_with_beta(
 		&provider,
-		body,
+		toolsearch_body("gpt-4o", false),
 		Some("tool-search-tool-2025-10-19,context-1m-2025-08-07"),
 	)
 	.await
@@ -4556,6 +4555,14 @@ async fn unverified_model_toolsearch_is_downgraded_to_ordinary_tools() {
 		.and_then(|v| v.to_str().ok())
 		.unwrap_or_default()
 		.to_string();
+	assert!(
+		!beta.contains("tool-search-tool") && !beta.contains("advanced-tool-use"),
+		"tool-search betas must be dropped on downgrade: {beta}"
+	);
+	assert!(
+		beta.contains("context-1m-2025-08-07"),
+		"unrelated betas must survive the downgrade: {beta}"
+	);
 	let rendered: Value = {
 		let bytes = http_body_util::BodyExt::collect(request.into_body())
 			.await
@@ -4573,8 +4580,135 @@ async fn unverified_model_toolsearch_is_downgraded_to_ordinary_tools() {
 		"defer_loading must be stripped so tools load upfront: {rendered}"
 	);
 	assert!(
+		!rendered_str.contains("tool_reference"),
+		"deferred-tool history plumbing must be rewritten, not forwarded: {rendered}"
+	);
+	assert!(
 		rendered_str.contains("get_weather"),
 		"the real tool must survive the downgrade: {rendered}"
+	);
+}
+
+#[tokio::test]
+async fn desktop_shaped_toolsearch_downgrades_on_anthropic_wire_streaming() {
+	// The production failure shape (2026-10-20): Claude Desktop, streaming,
+	// non-verified model, tool_reference history — served over the
+	// Anthropic Messages wire (Fireworks GLM). The downgrade must complete
+	// on the SSE path too: the rendered upstream body carries no tool_search
+	// server tool, no defer_loading, and no tool_reference plumbing, while
+	// ordinary history survives.
+	let _env = ScopedToolSearchEnv::allow("claude-sonnet-5-5").await;
+	let provider = AIProvider::Anthropic(anthropic::Provider {
+		model_override: None,
+	});
+	let mut body = toolsearch_body("glm-5p3", true);
+	body["messages"] = json!([
+		{"role": "user", "content": "list the widgets"},
+		{"role": "assistant", "content": [
+			{"type": "tool_use", "id": "toolu_9", "name": "get_weather", "input": {"city": "Rome"}},
+			{"type": "tool_reference", "tool_name": "mcp__example__list_widgets"}
+		]},
+		{"role": "user", "content": [
+			{"type": "tool_result", "tool_use_id": "toolu_9", "content": [
+				{"type": "text", "text": "18C"},
+				{"type": "tool_reference", "tool_name": "mcp__example__list_widgets"}
+			]}
+		]}
+	]);
+	let result =
+		process_toolsearch_messages_with_beta(&provider, body, Some("advanced-tool-use-2025-11-20"))
+			.await
+			.unwrap();
+	let RequestResult::Success { request, .. } = result else {
+		panic!("desktop-shaped streaming request must downgrade and pass, got {result:?}");
+	};
+	let rendered: Value = {
+		let bytes = http_body_util::BodyExt::collect(request.into_body())
+			.await
+			.unwrap()
+			.to_bytes();
+		serde_json::from_slice(&bytes).unwrap()
+	};
+	let rendered_str = rendered.to_string();
+	assert!(
+		!rendered_str.contains("tool_search")
+			&& !rendered_str.contains("tool_reference")
+			&& !rendered_str.contains("defer_loading"),
+		"anthropic-wire render must be fully downgraded: {rendered}"
+	);
+	assert!(
+		rendered_str.contains("toolu_9"),
+		"ordinary tool history must survive: {rendered}"
+	);
+	assert!(
+		rendered.get("stream").and_then(Value::as_bool) == Some(true),
+		"streaming intent must survive: {rendered}"
+	);
+}
+
+#[tokio::test]
+async fn native_search_round_history_on_unverified_model_downgrades() {
+	// Mid-conversation model switch: the history replays a native search
+	// round (server_tool_use + tool_search_tool_result) from an earlier
+	// Anthropic-model turn while the selected model is unverified. Before
+	// the 2026-10-20 fix these blocks were undetected and reached the
+	// upstream verbatim (production: Fireworks 400 on unknown content
+	// types); now the whole round is rewritten away and the embedded
+	// definition is hoisted into the eager tools.
+	let _env = ScopedToolSearchEnv::allow("claude-sonnet-5-5").await;
+	let provider = AIProvider::Anthropic(anthropic::Provider {
+		model_override: None,
+	});
+	let body = json!({
+		"model": "glm-5p3",
+		"max_tokens": 64,
+		"messages": [
+			{"role": "user", "content": "find a tool for that"},
+			{"role": "assistant", "content": [
+				{"type": "server_tool_use", "id": "srvtoolu_1", "name": "tool_search", "input": {"query": "widgets"}},
+				{"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [
+					{
+						"type": "tool_reference",
+						"tool_name": "mcp__example__list_widgets",
+						"description": "List widgets",
+						"input_schema": {"type": "object"}
+					}
+				]},
+				{"type": "text", "text": "found it"}
+			]}
+		],
+		"tools": [
+			{
+				"name": "get_weather",
+				"description": "Get the weather",
+				"input_schema": {"type": "object"},
+				"defer_loading": true
+			}
+		]
+	});
+	let result = process_toolsearch_messages(&provider, body).await.unwrap();
+	let RequestResult::Success { request, .. } = result else {
+		panic!("search-round history on an unverified model must downgrade, got {result:?}");
+	};
+	let rendered: Value = {
+		let bytes = http_body_util::BodyExt::collect(request.into_body())
+			.await
+			.unwrap()
+			.to_bytes();
+		serde_json::from_slice(&bytes).unwrap()
+	};
+	let rendered_str = rendered.to_string();
+	assert!(
+		!rendered_str.contains("server_tool_use") && !rendered_str.contains("tool_search_tool_result"),
+		"search-round blocks must not reach the upstream: {rendered}"
+	);
+	assert!(
+		rendered["tools"]
+			.as_array()
+			.expect("tools survive")
+			.iter()
+			.any(|t| t["name"].as_str() == Some("mcp__example__list_widgets")),
+		"embedded definition must be hoisted into the eager tools: {rendered}"
 	);
 }
 
@@ -4583,15 +4717,16 @@ async fn toolsearch_env_absent_downgrades_gracefully() {
 	// Absent allowlist = no model verified = every Tool Search request is
 	// downgraded (feature degrades gracefully; nothing fails hard). This is
 	// the rollback posture: unset the env and the flag-flipped clients keep
-	// working with upfront tool loading.
+	// working with upfront tool loading — including the Desktop-shaped
+	// tool_reference history.
 	let _env = ScopedToolSearchEnv::allow("").await;
 	let provider = AIProvider::OpenAI(openai::Provider {
 		model_override: None,
 		moderation: None,
 	});
-	let mut body = toolsearch_body("gpt-4o", false);
-	body["messages"] = json!([{"role": "user", "content": "find a tool for that"}]);
-	let result = process_toolsearch_messages(&provider, body).await.unwrap();
+	let result = process_toolsearch_messages(&provider, toolsearch_body("gpt-4o", false))
+		.await
+		.unwrap();
 	assert!(
 		matches!(result, RequestResult::Success { .. }),
 		"env absent must downgrade instead of rejecting: {result:?}"

@@ -31,15 +31,17 @@ pub struct Request {
 
 impl Request {
 	/// Whether this request carries native Anthropic Tool Search (deferred tool
-	/// loading) semantics: a `tool_search*` server tool offered in `tools`, or a
-	/// `tool_reference` content block in the conversation — either an assistant
-	/// turn requesting a deferred tool's schema, or a `tool_result` embedding the
-	/// schema reply. These semantics cannot survive a chat format conversion (the
-	/// Bedrock Converse/OpenAI/Gemini conversions drop the server tool and
-	/// flatten `tool_reference` blocks into plain text), so callers must keep
-	/// such requests on an Anthropic Messages-compatible upstream rather than
-	/// silently degrading them. Detection runs on the passthrough shape, which
-	/// preserves unknown blocks verbatim.
+	/// loading) semantics: a `tool_search*` server tool offered in `tools`, or
+	/// deferred-tool protocol blocks in the conversation — a `tool_reference`
+	/// content block (an assistant turn referencing a deferred tool, or a
+	/// `tool_result` embedding the schema reply), a `server_tool_use` block for
+	/// the tool_search server tool, or a `tool_search_tool_result` block from a
+	/// completed search round. These semantics cannot survive a chat format
+	/// conversion (the Bedrock Converse/OpenAI/Gemini conversions drop the
+	/// server tool and flatten `tool_reference` blocks into plain text), so
+	/// callers must keep such requests on an Anthropic Messages-compatible
+	/// upstream rather than silently degrading them. Detection runs on the
+	/// passthrough shape, which preserves unknown blocks verbatim.
 	pub fn uses_native_tool_search(&self) -> bool {
 		tools_offer_native_tool_search(self.rest.get("tools"))
 			|| self.messages.iter().any(|m| {
@@ -50,33 +52,239 @@ impl Request {
 	}
 
 	/// Downgrade this request's Tool Search (deferred tool loading) shapes to
-	/// ordinary upfront-tool-loading inference: drop every `tool_search*`
-	/// server tool from `tools` and strip `defer_loading` flags from the
-	/// remaining (real) tool definitions, which stay fully declared — only
-	/// their context-deferral hint is removed. Conversation history is left
-	/// untouched: a transcript that already carries `tool_reference` blocks
-	/// genuinely depends on deferred-tool semantics, and rewriting it would
-	/// corrupt the conversation — such requests stay `uses_native_tool_search
-	/// == true` after this call (callers re-check) and keep the
-	/// Anthropic-compatible-only guard. Callers must also drop the
-	/// tool-search `anthropic-beta` header values from the forwarded request.
-	pub fn downgrade_tool_search(&mut self) {
-		let Some(tools) = self.rest.get_mut("tools").and_then(|t| t.as_array_mut()) else {
-			return;
-		};
-		// A no-op when no tool_search tool is offered: the retain keeps every
-		// entry and only the defer_loading strip runs (harmless on tools that
-		// never carried the flag).
-		tools.retain(|tool| {
-			tool
-				.get("type")
-				.and_then(serde_json::Value::as_str)
-				.is_none_or(|tool_type| !tool_type.starts_with("tool_search"))
-		});
-		for tool in tools.iter_mut() {
-			if let Some(object) = tool.as_object_mut() {
-				object.remove("defer_loading");
+	/// ordinary upfront-tool-loading inference:
+	///
+	/// * `tools`: drop every `tool_search*` server tool and strip
+	///   `defer_loading` flags from the remaining (real) tool definitions,
+	///   which stay fully declared — only their context-deferral hint is
+	///   removed. A `tool_reference` that carries a full `input_schema` (some
+	///   clients embed definitions in search results) is hoisted into `tools`
+	///   so the eager model keeps access to that tool.
+	/// * history: rewrite the deferred-tool protocol plumbing into an eager
+	///   equivalent — remove `tool_reference` parts, remove the
+	///   `server_tool_use`/`tool_search_tool_result` search-round blocks, and
+	///   drop `tool_reference` parts nested inside `tool_result` content.
+	///   These blocks are protocol plumbing between the client and a native
+	///   Tool Search model: the tools themselves stay declared in `tools`
+	///   (eager), ordinary `tool_use`/`tool_result` history is untouched, and
+	///   no user content is affected. (2026-10-20 incident: Claude Desktop
+	///   inserts `tool_reference` blocks on turns after tool use, so
+	///   preserving them kept every non-Anthropic model failing with 400
+	///   `unverified-provider` after an otherwise successful first turn.)
+	/// * `tool_choice` pinned to a removed server tool — or any `tool_choice`
+	///   once `tools` ends up empty — is dropped so the upstream never sees a
+	///   choice referencing an undeclared tool.
+	///
+	/// A message whose content array becomes empty after the rewrite (e.g. a
+	/// pure search-round assistant turn) is replaced with a fixed text marker
+	/// so message count and user/assistant alternation survive intact.
+	///
+	/// After this call `uses_native_tool_search()` must return `false`; the
+	/// caller re-checks and keeps the strict Anthropic-compatible-only guard
+	/// for anything the rewrite could not translate (defense in depth).
+	/// Callers must also drop the tool-search `anthropic-beta` header values
+	/// from the forwarded request.
+	pub fn downgrade_tool_search(&mut self) -> ToolSearchDowngrade {
+		let mut report = ToolSearchDowngrade::default();
+
+		if let Some(tools) = self.rest.get_mut("tools").and_then(|t| t.as_array_mut()) {
+			for tool in tools.iter_mut() {
+				if let Some(object) = tool.as_object_mut()
+					&& object.remove("defer_loading").is_some()
+				{
+					report.stripped_defer_loading += 1;
+				}
 			}
+			let server_tools = tools.len();
+			tools.retain(|tool| {
+				tool
+					.get("type")
+					.and_then(serde_json::Value::as_str)
+					.is_none_or(|tool_type| !tool_type.starts_with("tool_search"))
+			});
+			report.removed_server_tools = server_tools - tools.len();
+		}
+
+		let mut hoisted: Vec<serde_json::Value> = Vec::new();
+		for message in self.messages.iter_mut() {
+			let Some(ContentBlock::Array(parts)) = message.content.as_mut() else {
+				continue;
+			};
+			sanitize_deferred_tool_parts(parts, &mut hoisted, &mut report);
+			if parts.is_empty() {
+				// Keep the message (count and alternation) with a neutral
+				// marker instead of sending an empty content array upstream.
+				*parts = vec![ContentPart::Text {
+					r#type: "text".to_string(),
+					text: "[tool search]".to_string(),
+					rest: serde_json::Value::Null,
+				}];
+			}
+		}
+
+		if !hoisted.is_empty() {
+			let known: Vec<String> = self
+				.rest
+				.get("tools")
+				.and_then(|t| t.as_array())
+				.map(|tools| {
+					tools
+						.iter()
+						.filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+						.map(str::to_string)
+						.collect()
+				})
+				.unwrap_or_default();
+			let tools = self
+				.rest
+				.as_object_mut()
+				.map(|o| {
+					o.entry("tools")
+						.or_insert_with(|| serde_json::Value::Array(Vec::new()))
+				})
+				.and_then(|t| t.as_array_mut());
+			if let Some(tools) = tools {
+				for definition in hoisted {
+					let name = definition
+						.get("name")
+						.and_then(|n| n.as_str())
+						.map(str::to_string);
+					if name
+						.as_deref()
+						.is_some_and(|n| known.iter().any(|k| k == n))
+					{
+						continue;
+					}
+					tools.push(definition);
+					report.hoisted_schemas += 1;
+				}
+			}
+		}
+
+		// A tool_choice pinned to a removed server tool would reference an
+		// undeclared tool upstream; an empty tools array cannot back any
+		// tool_choice at all.
+		let remaining_names: Vec<String> = self
+			.rest
+			.get("tools")
+			.and_then(|t| t.as_array())
+			.map(|tools| {
+				tools
+					.iter()
+					.filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+					.map(str::to_string)
+					.collect()
+			})
+			.unwrap_or_default();
+		let tools_empty = remaining_names.is_empty();
+		if let Some(choice) = self.rest.get("tool_choice") {
+			let pinned = choice.get("name").and_then(|n| n.as_str());
+			let unresolvable =
+				tools_empty || pinned.is_some_and(|name| !remaining_names.iter().any(|n| n == name));
+			if unresolvable && let Some(object) = self.rest.as_object_mut() {
+				object.remove("tool_choice");
+				report.neutralized_tool_choice = true;
+			}
+		}
+		if tools_empty && let Some(object) = self.rest.as_object_mut() {
+			object.remove("tools");
+		}
+
+		report
+	}
+}
+
+/// Sanitized outcome of a Tool Search downgrade — counts and flags only, for
+/// telemetry and tests. Never carries tool names, schemas, or content.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ToolSearchDowngrade {
+	pub removed_server_tools: usize,
+	pub stripped_defer_loading: usize,
+	pub removed_tool_references: usize,
+	pub removed_search_rounds: usize,
+	pub hoisted_schemas: usize,
+	pub neutralized_tool_choice: bool,
+}
+
+/// Extract a full eager tool definition from a `tool_reference` block that
+/// carries one (`input_schema` present). Most `tool_reference` blocks are bare
+/// pointers; only search-result payloads embed definitions.
+fn hoistable_definition(value: &serde_json::Value) -> Option<serde_json::Value> {
+	let object = value.as_object()?;
+	let schema = object.get("input_schema")?;
+	let mut definition = serde_json::Map::new();
+	definition.insert(
+		"name".to_string(),
+		object
+			.get("name")
+			.or_else(|| object.get("tool_name"))?
+			.clone(),
+	);
+	if let Some(description) = object.get("description") {
+		definition.insert("description".to_string(), description.clone());
+	}
+	definition.insert("input_schema".to_string(), schema.clone());
+	Some(serde_json::Value::Object(definition))
+}
+
+/// Rewrite the deferred-tool protocol parts inside one message content array
+/// into their eager equivalent, collecting any embedded full tool definitions
+/// for hoisting into `tools`.
+fn sanitize_deferred_tool_parts(
+	parts: &mut Vec<ContentPart>,
+	hoisted: &mut Vec<serde_json::Value>,
+	report: &mut ToolSearchDowngrade,
+) {
+	let mut index = 0;
+	while index < parts.len() {
+		let ContentPart::Unknown(value) = &parts[index] else {
+			index += 1;
+			continue;
+		};
+		match value.get("type").and_then(serde_json::Value::as_str) {
+			Some("tool_reference") => {
+				if let Some(definition) = hoistable_definition(value) {
+					hoisted.push(definition);
+				}
+				report.removed_tool_references += 1;
+				parts.remove(index);
+			},
+			Some("server_tool_use") => {
+				let is_search = value
+					.get("name")
+					.and_then(serde_json::Value::as_str)
+					.is_some_and(|name| name.starts_with("tool_search"));
+				if is_search {
+					report.removed_search_rounds += 1;
+					parts.remove(index);
+				} else {
+					index += 1;
+				}
+			},
+			Some("tool_search_tool_result") => {
+				if let Some(content) = value.get("content").and_then(|c| c.as_array()) {
+					for part in content {
+						if part.get("type").and_then(|t| t.as_str()) == Some("tool_reference")
+							&& let Some(definition) = hoistable_definition(part)
+						{
+							hoisted.push(definition);
+						}
+					}
+				}
+				report.removed_search_rounds += 1;
+				parts.remove(index);
+			},
+			Some("tool_result") => {
+				if let ContentPart::Unknown(value) = &mut parts[index]
+					&& let Some(nested) = value.get_mut("content").and_then(|c| c.as_array_mut())
+				{
+					let nested_before = nested.len();
+					nested.retain(|part| part.get("type").and_then(|t| t.as_str()) != Some("tool_reference"));
+					report.removed_tool_references += nested_before - nested.len();
+				}
+				index += 1;
+			},
+			_ => index += 1,
 		}
 	}
 }
@@ -97,8 +305,10 @@ fn tools_offer_native_tool_search(tools: Option<&serde_json::Value>) -> bool {
 }
 
 /// A message content block referencing a deferred tool: a top-level
-/// `tool_reference` part (assistant turn), or a `tool_result` whose content
-/// array carries the deferred tool's schema reply as a `tool_reference` part.
+/// `tool_reference` part (assistant turn), a `tool_result` whose content
+/// array carries the deferred tool's schema reply as a `tool_reference` part,
+/// a `server_tool_use` block invoking the tool_search server tool, or a
+/// `tool_search_tool_result` block from a completed search round.
 fn content_references_deferred_tool(block: &ContentBlock) -> bool {
 	let ContentBlock::Array(parts) = block else {
 		return false;
@@ -112,6 +322,11 @@ fn part_references_deferred_tool(part: &ContentPart) -> bool {
 	};
 	match value.get("type").and_then(serde_json::Value::as_str) {
 		Some("tool_reference") => true,
+		Some("tool_search_tool_result") => true,
+		Some("server_tool_use") => value
+			.get("name")
+			.and_then(serde_json::Value::as_str)
+			.is_some_and(|name| name.starts_with("tool_search")),
 		Some("tool_result") => value
 			.get("content")
 			.and_then(serde_json::Value::as_array)
@@ -1852,27 +2067,207 @@ mod tests {
 	}
 
 	#[test]
-	fn downgrade_never_rewrites_tool_reference_history() {
-		// A transcript that already depends on deferred-tool semantics stays
-		// native Tool Search after the downgrade attempt: rewriting history
-		// would corrupt the conversation, so such requests keep the strict
-		// Anthropic-compatible-only guard.
+	fn downgrade_translates_tool_reference_history_to_eager() {
+		// 2026-10-20 production incident (Claude Desktop + non-Anthropic
+		// models): Desktop's engine inserts `tool_reference` blocks on turns
+		// after tool use. The downgrade must rewrite that history into its
+		// eager equivalent — tool_reference plumbing removed, ordinary
+		// tool_use/tool_result untouched — instead of keeping the request
+		// native and failing the strict guard with 400.
 		let body = serde_json::json!({
-			"model": "claude-sonnet-4-5",
+			"model": "glm-5p3",
 			"max_tokens": 64,
 			"messages": [
 				{"role": "user", "content": "list the widgets"},
 				{"role": "assistant", "content": [
+					{"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Rome"}},
 					{"type": "tool_reference", "tool_name": "mcp__example__list_widgets"}
+				]},
+				{"role": "user", "content": [
+					{"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+						{"type": "text", "text": "18C"},
+						{"type": "tool_reference", "tool_name": "mcp__example__list_widgets"}
+					]}
 				]}
 			],
-			"tools": [{"type": "tool_search_tool_regex_20250922"}]
+			"tools": [
+				{"type": "tool_search_tool_regex_20250922", "name": "tool_search"},
+				{
+					"name": "get_weather",
+					"description": "Get the weather",
+					"input_schema": {"type": "object"},
+					"defer_loading": true
+				}
+			]
 		});
 		let mut req = parse_request(body);
-		req.downgrade_tool_search();
+		assert!(req.uses_native_tool_search());
+		let report = req.downgrade_tool_search();
+		assert!(
+			!req.uses_native_tool_search(),
+			"history rewrite must complete the downgrade"
+		);
+		assert_eq!(report.removed_server_tools, 1);
+		assert_eq!(report.stripped_defer_loading, 1);
+		assert_eq!(report.removed_tool_references, 2);
+		assert_eq!(report.removed_search_rounds, 0);
+		let serialized = serde_json::to_value(&req).unwrap();
+		assert!(
+			!serialized.to_string().contains("tool_reference"),
+			"no tool_reference plumbing may survive: {serialized}"
+		);
+		assert!(
+			serialized.to_string().contains("toolu_1"),
+			"ordinary tool_use/tool_result history must survive: {serialized}"
+		);
+	}
+
+	#[test]
+	fn native_search_round_history_is_detected_and_downgraded() {
+		// Mid-conversation model switch (native Tool Search turn on an
+		// Anthropic model, then a non-Anthropic model): the replayed history
+		// carries the search-round blocks. Detection must catch them and the
+		// downgrade must remove them — before the 2026-10-20 fix these blocks
+		// were neither detected nor removed and the upstream rejected the
+		// unknown content types with 400.
+		let body = serde_json::json!({
+			"model": "glm-5p3",
+			"max_tokens": 64,
+			"messages": [
+				{"role": "user", "content": "find a tool for that"},
+				{"role": "assistant", "content": [
+					{"type": "server_tool_use", "id": "srvtoolu_1", "name": "tool_search", "input": {"query": "widgets"}},
+					{"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [
+						{
+							"type": "tool_reference",
+							"tool_name": "mcp__example__list_widgets",
+							"description": "List widgets",
+							"input_schema": {"type": "object"}
+						}
+					]},
+					{"type": "text", "text": "found it"}
+				]}
+			],
+			"tools": [
+				{
+					"name": "get_weather",
+					"description": "Get the weather",
+					"input_schema": {"type": "object"},
+					"defer_loading": true
+				}
+			]
+		});
+		let mut req = parse_request(body);
 		assert!(
 			req.uses_native_tool_search(),
-			"tool_reference history keeps the request native after downgrade"
+			"search-round blocks must count as native Tool Search"
+		);
+		let report = req.downgrade_tool_search();
+		assert!(!req.uses_native_tool_search());
+		assert_eq!(report.removed_search_rounds, 2);
+		assert_eq!(
+			report.hoisted_schemas, 1,
+			"embedded definition must be hoisted"
+		);
+		let serialized = serde_json::to_value(&req).unwrap();
+		assert!(
+			!serialized.to_string().contains("server_tool_use")
+				&& !serialized.to_string().contains("tool_search_tool_result"),
+			"search-round blocks must be gone: {serialized}"
+		);
+		let tools = serialized["tools"].as_array().unwrap();
+		assert!(
+			tools
+				.iter()
+				.any(|t| t["name"].as_str() == Some("mcp__example__list_widgets")),
+			"hoisted definition must be declared eager: {tools:?}"
+		);
+	}
+
+	#[test]
+	fn empty_search_round_turn_becomes_marker_text() {
+		// A pure search-round assistant turn must keep its slot (message count
+		// and user/assistant alternation) instead of forwarding an empty
+		// content array upstream.
+		let body = serde_json::json!({
+			"model": "glm-5p3",
+			"max_tokens": 64,
+			"messages": [
+				{"role": "user", "content": "find a tool"},
+				{"role": "assistant", "content": [
+					{"type": "server_tool_use", "id": "srvtoolu_2", "name": "tool_search", "input": {"query": "x"}},
+					{"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_2", "content": []}
+				]},
+				{"role": "user", "content": "thanks"}
+			]
+		});
+		let mut req = parse_request(body);
+		assert!(req.uses_native_tool_search());
+		req.downgrade_tool_search();
+		assert_eq!(req.messages.len(), 3, "message count must be preserved");
+		let serialized = serde_json::to_value(&req).unwrap();
+		let middle = &serialized["messages"][1]["content"];
+		assert_eq!(
+			middle[0]["type"].as_str(),
+			Some("text"),
+			"emptied turn becomes a text marker: {middle}"
+		);
+	}
+
+	#[test]
+	fn downgrade_neutralizes_tool_choice_pinned_to_server_tool() {
+		let mut body = toolsearch_body_base();
+		body["tools"] = serde_json::json!([
+			{"type": "tool_search_tool_regex_20250922", "name": "tool_search"},
+			{"name": "get_weather", "description": "Get the weather", "input_schema": {"type": "object"}}
+		]);
+		body["tool_choice"] = serde_json::json!({"type": "tool", "name": "tool_search"});
+		let mut req = parse_request(body);
+		let report = req.downgrade_tool_search();
+		assert!(report.neutralized_tool_choice);
+		let serialized = serde_json::to_value(&req).unwrap();
+		assert!(serialized.get("tool_choice").is_none(), "{serialized}");
+		assert!(
+			serialized["tools"].as_array().unwrap().len() == 1,
+			"the real tool stays: {serialized}"
+		);
+	}
+
+	#[test]
+	fn downgrade_drops_tools_when_only_the_server_tool_remained() {
+		let mut body = toolsearch_body_base();
+		body["tools"] =
+			serde_json::json!([{"type": "tool_search_tool_regex_20250922", "name": "tool_search"}]);
+		body["tool_choice"] = serde_json::json!({"type": "auto"});
+		let mut req = parse_request(body);
+		assert!(req.uses_native_tool_search());
+		req.downgrade_tool_search();
+		let serialized = serde_json::to_value(&req).unwrap();
+		assert!(
+			serialized.get("tools").is_none(),
+			"empty tools array is dropped entirely: {serialized}"
+		);
+		assert!(serialized.get("tool_choice").is_none(), "{serialized}");
+	}
+
+	#[test]
+	fn search_round_blocks_are_detected_but_ordinary_server_tools_are_not() {
+		let mut body = toolsearch_body_base();
+		body["messages"] = serde_json::json!([
+			{"role": "user", "content": "search"},
+			{"role": "assistant", "content": [
+				{"type": "server_tool_use", "id": "srvtoolu_3", "name": "web_search", "input": {"query": "x"}},
+				{"type": "web_search_tool_result", "tool_use_id": "srvtoolu_3", "content": []}
+			]}
+		]);
+		assert!(
+			!parse_request(body.clone()).uses_native_tool_search(),
+			"non-tool-search server tools are not deferred-tool semantics"
+		);
+		body["messages"][1]["content"][0]["name"] = serde_json::json!("tool_search");
+		assert!(
+			parse_request(body).uses_native_tool_search(),
+			"a tool_search server_tool_use must be detected"
 		);
 	}
 }

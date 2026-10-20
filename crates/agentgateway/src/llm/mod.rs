@@ -1786,13 +1786,28 @@ impl AIProvider {
 		// client's Tool Search shapes are downgraded to ordinary
 		// upfront-tool-loading inference here — before routing, so failover
 		// stays fully available — keeping unverified models' ordinary
-		// workflows (including tool use) working instead of erroring.
-		// Conversations that already carry tool_reference history cannot be
-		// safely downgraded and keep the strict guard below.
+		// workflows (including tool use) working instead of erroring. The
+		// downgrade rewrites the deferred-tool protocol plumbing in history
+		// (tool_reference parts, search-round blocks) into its eager
+		// equivalent; anything it cannot translate keeps the strict guard
+		// below (defense in depth).
 		let mut native_tool_search = req.uses_native_tool_search();
 		if native_tool_search && !tool_search_model_allowed(req.model.as_deref().unwrap_or_default()) {
-			req.downgrade_tool_search();
+			let report = req.downgrade_tool_search();
 			strip_tool_search_beta_headers(&mut parts.headers);
+			// Sanitized decision telemetry (counts only, never tool names or
+			// content): distinguishes eager downgrades from native serving and
+			// quantifies the history rewrite for observability.
+			info!(
+				tool_search.decision = "downgraded-eager",
+				tool_search.removed_server_tools = report.removed_server_tools,
+				tool_search.stripped_defer_loading = report.stripped_defer_loading,
+				tool_search.removed_tool_references = report.removed_tool_references,
+				tool_search.removed_search_rounds = report.removed_search_rounds,
+				tool_search.hoisted_schemas = report.hoisted_schemas,
+				tool_search.neutralized_tool_choice = report.neutralized_tool_choice,
+				"tool search downgraded to eager tool loading for unverified model"
+			);
 			native_tool_search = req.uses_native_tool_search();
 		}
 
