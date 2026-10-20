@@ -123,7 +123,11 @@ impl Request {
 		}
 
 		if !hoisted.is_empty() {
-			let known: Vec<String> = self
+			// Deduplicate against tools already declared AND against copies
+			// hoisted earlier in this loop: the same deferred tool can embed
+			// its definition in more than one history block, and a duplicate
+			// tool name would make the upstream reject the whole request.
+			let mut known: Vec<String> = self
 				.rest
 				.get("tools")
 				.and_then(|t| t.as_array())
@@ -154,6 +158,9 @@ impl Request {
 						.is_some_and(|n| known.iter().any(|k| k == n))
 					{
 						continue;
+					}
+					if let Some(name) = name {
+						known.push(name);
 					}
 					tools.push(definition);
 					report.hoisted_schemas += 1;
@@ -2212,6 +2219,154 @@ mod tests {
 			Some("text"),
 			"emptied turn becomes a text marker: {middle}"
 		);
+	}
+
+	#[test]
+	fn eager_downgrade_preserves_every_tool_definition() {
+		// Availability proof for the eager compatibility path: a realistic
+		// Desktop/CLI shape (30 deferred MCP tools + 5 eager core tools + the
+		// tool_search server tool, with a tool round and a Desktop-style
+		// pre-load in history) must reach the upstream with all 35 ordinary
+		// definitions byte-identical, so every deferred tool stays invocable.
+		let deferred: Vec<serde_json::Value> = (0..30)
+			.map(|i| {
+				serde_json::json!({
+					"name": format!("mcp__srv__tool_{i}"),
+					"description": format!("Deferred tool {i}"),
+					"input_schema": {
+						"type": "object",
+						"properties": {"arg_{i}": {"type": "string", "description": format!("argument {i}")}},
+						"required": ["arg_{i}"]
+					},
+					"defer_loading": true
+				})
+			})
+			.collect();
+		let eager: Vec<serde_json::Value> = (0..5)
+			.map(|i| {
+				serde_json::json!({
+					"name": format!("core_tool_{i}"),
+					"description": format!("Core tool {i}"),
+					"input_schema": {"type": "object", "properties": {"x": {"type": "number"}}}
+				})
+			})
+			.collect();
+		let mut tools = deferred.clone();
+		tools.extend(eager.clone());
+		tools.push(serde_json::json!({"type": "tool_search_tool_regex_20250922", "name": "tool_search"}));
+
+		let body = serde_json::json!({
+			"model": "glm-5p3",
+			"max_tokens": 64,
+			"messages": [
+				{"role": "user", "content": "use core tool 0"},
+				{"role": "assistant", "content": [
+					{"type": "tool_use", "id": "toolu_1", "name": "core_tool_0", "input": {"x": 1}}
+				]},
+				{"role": "user", "content": [
+					{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"},
+					{"type": "tool_reference", "tool_name": "mcp__srv__tool_7"}
+				]},
+				{"role": "user", "content": "now use deferred tool 29"}
+			],
+			"tools": tools,
+			"tool_choice": {"type": "auto"}
+		});
+		let mut req = parse_request(body);
+		assert!(req.uses_native_tool_search());
+		let report = req.downgrade_tool_search();
+		assert_eq!(report.stripped_defer_loading, 30);
+		assert_eq!(report.removed_server_tools, 1);
+		assert_eq!(report.removed_tool_references, 1);
+
+		let serialized = serde_json::to_value(&req).unwrap();
+		let out_tools = serialized["tools"].as_array().unwrap();
+		assert_eq!(
+			out_tools.len(),
+			35,
+			"all ordinary definitions must survive: {report:?}"
+		);
+		let mut expected: Vec<serde_json::Value> = deferred
+			.iter()
+			.map(|t| {
+				let mut t = t.clone();
+				t.as_object_mut().unwrap().remove("defer_loading");
+				t
+			})
+			.collect();
+		expected.extend(eager);
+		let by_name = |v: &serde_json::Value| {
+			v.get("name").and_then(|n| n.as_str()).unwrap().to_string()
+		};
+		let mut out_sorted = out_tools.clone();
+		out_sorted.sort_by_key(by_name);
+		let mut expected_sorted = expected;
+		expected_sorted.sort_by_key(by_name);
+		assert_eq!(
+			out_sorted, expected_sorted,
+			"surviving definitions must be byte-identical to the client's (minus defer_loading)"
+		);
+		assert_eq!(
+			serialized["tool_choice"],
+			serde_json::json!({"type": "auto"}),
+			"ordinary tool_choice must be preserved"
+		);
+		assert!(
+			serialized["messages"][2]["content"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.any(|p| p["type"].as_str() == Some("tool_result")),
+			"the ordinary tool round must stay in history"
+		);
+	}
+
+	#[test]
+	fn hoisted_definitions_deduplicate_by_tool_name() {
+		// The same deferred tool can surface in more than one search round or
+		// be pre-loaded across several Desktop turns. Each occurrence embeds
+		// its own copy of the definition; hoisting every copy would declare
+		// the tool twice and upstreams reject duplicate tool names with 400.
+		let definition = serde_json::json!({
+			"type": "tool_reference",
+			"tool_name": "mcp__example__list_widgets",
+			"description": "List widgets",
+			"input_schema": {"type": "object", "properties": {"a": {"type": "string"}}}
+		});
+		let body = serde_json::json!({
+			"model": "glm-5p3",
+			"max_tokens": 64,
+			"messages": [
+				{"role": "user", "content": "find a tool"},
+				{"role": "assistant", "content": [
+					{"type": "server_tool_use", "id": "srvtoolu_1", "name": "tool_search", "input": {"query": "widgets"}},
+					{"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [definition.clone()]},
+					{"type": "text", "text": "found it"}
+				]},
+				{"role": "user", "content": "again"},
+				{"role": "assistant", "content": [
+					{"type": "server_tool_use", "id": "srvtoolu_2", "name": "tool_search", "input": {"query": "widgets"}},
+					{"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_2", "content": [definition]},
+					{"type": "text", "text": "still found"}
+				]}
+			],
+			"tools": []
+		});
+		let mut req = parse_request(body);
+		assert!(req.uses_native_tool_search());
+		let report = req.downgrade_tool_search();
+		assert_eq!(
+			report.hoisted_schemas, 1,
+			"the second embedded copy must not be hoisted again: {report:?}"
+		);
+		let serialized = serde_json::to_value(&req).unwrap();
+		let names: Vec<&str> = serialized["tools"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.filter_map(|t| t["name"].as_str())
+			.collect();
+		assert_eq!(names, vec!["mcp__example__list_widgets"], "{serialized}");
 	}
 
 	#[test]
