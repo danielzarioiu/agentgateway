@@ -1766,6 +1766,19 @@ impl AIProvider {
 	/// leg accepts the request but silently eager-loads deferred tools).
 	pub fn provider_serves_native_tool_search(&self) -> bool {
 		matches!(self, AIProvider::Anthropic(_))
+			|| (provider_kind_probe_enabled() && self.is_anthropic_compatible_probe_kind())
+	}
+
+	/// Controlled stage-only conformance probe (2026-10-20 Phase 4): when
+	/// AGENTGATEWAY_TOOL_SEARCH_PROVIDER_PROBE=true, custom-provider legs
+	/// with an explicit Anthropic-Messages output format (the Fireworks and
+	/// OpenRouter claude listeners) are allowed to receive native Tool
+	/// Search shapes so the provider's REAL behavior can be observed for the
+	/// conformance matrix. Never enabled in production; the entry allowlist
+	/// must ALSO name the model and the per-attempt output-format guard
+	/// still applies.
+	fn is_anthropic_compatible_probe_kind(&self) -> bool {
+		matches!(self, AIProvider::Custom(_))
 	}
 
 	pub async fn process_messages_request(
@@ -3484,6 +3497,15 @@ fn anthropic_toolsearch_incompatible(upstream: &str) -> ::http::Response<Body> {
 		.header(::http::header::CONTENT_TYPE, "application/json")
 		.body(Body::from(body.to_string()))
 		.expect("failed to build anthropic error response")
+}
+
+/// Stage-only conformance probe switch (default OFF everywhere): lets
+/// custom-provider Anthropic-Messages legs receive native Tool Search shapes
+/// for the Phase 4 Fireworks conformance matrix. See
+/// `AIProvider::is_anthropic_compatible_probe_kind`.
+fn provider_kind_probe_enabled() -> bool {
+	std::env::var("AGENTGATEWAY_TOOL_SEARCH_PROVIDER_PROBE")
+		.is_ok_and(|value| value.trim() == "true")
 }
 
 /// Models whose native Tool Search (deferred tool loading) this gateway is
