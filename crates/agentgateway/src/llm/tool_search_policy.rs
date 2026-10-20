@@ -141,6 +141,9 @@ pub struct ToolSearchDecision {
 	/// Sanitized reason for telemetry (static strings, never model or tool
 	/// names).
 	pub reason: &'static str,
+	/// Revision of the policy snapshot this decision was resolved against
+	/// (`None` when no artifact is loaded — env-only behavior).
+	pub policy_revision: Option<String>,
 }
 
 /// Resolve whether native Tool Search may be served for `model`.
@@ -152,34 +155,41 @@ pub fn tool_search_decision(env_allows_native: bool, model: &str) -> ToolSearchD
 		return ToolSearchDecision {
 			allow_native: env_allows_native,
 			reason: if env_allows_native { "env-allowlist" } else { "env-allowlist-miss" },
+			policy_revision: None,
 		};
 	};
+	let revision = Some(policy.revision.clone());
 	match policy.mode_for(model) {
 		PolicyMode::Off => ToolSearchDecision {
 			allow_native: false,
 			reason: "policy-off",
+			policy_revision: revision,
 		},
 		PolicyMode::Eager => ToolSearchDecision {
 			allow_native: false,
 			reason: "policy-eager",
+			policy_revision: revision,
 		},
 		PolicyMode::Native => {
 			if env_allows_native {
 				ToolSearchDecision {
 					allow_native: true,
 					reason: "policy-native-env-confirmed",
+					policy_revision: revision,
 				}
 			} else {
 				// Two-key rule: the artifact alone cannot bootstrap native.
 				ToolSearchDecision {
 					allow_native: false,
 					reason: "policy-native-without-env-bootstrap",
+					policy_revision: revision,
 				}
 			}
 		},
 		PolicyMode::Auto => ToolSearchDecision {
 			allow_native: env_allows_native,
 			reason: "policy-auto-env",
+			policy_revision: revision,
 		},
 	}
 }
@@ -188,13 +198,23 @@ pub fn tool_search_decision(env_allows_native: bool, model: &str) -> ToolSearchD
 /// so tests and operational runbooks can drive a single refresh
 /// deterministically. On any failure the current snapshot is left untouched
 /// (last-known-good) and the error is returned for logging.
+///
+/// `AGENTGATEWAY_TOOL_SEARCH_POLICY_TOKEN` (optional): sent as
+/// `Authorization: Bearer <token>` when the artifact endpoint requires the
+/// control plane's machine token. The token lives in the deployment's secret
+/// pipeline, never in the policy URL itself.
 pub async fn refresh_policy_once(url: &str) -> Result<ToolSearchPolicyDoc, String> {
 	let client = reqwest::Client::builder()
 		.timeout(FETCH_TIMEOUT)
 		.build()
 		.map_err(|error| format!("policy http client: {error}"))?;
-	let response = client
-		.get(url)
+	let mut request = client.get(url);
+	if let Ok(token) = std::env::var("AGENTGATEWAY_TOOL_SEARCH_POLICY_TOKEN")
+		&& !token.trim().is_empty()
+	{
+		request = request.bearer_auth(token);
+	}
+	let response = request
 		.send()
 		.await
 		.map_err(|error| format!("policy fetch failed: {error}"))?;
