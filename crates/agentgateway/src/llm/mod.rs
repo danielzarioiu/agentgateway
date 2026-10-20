@@ -1763,22 +1763,12 @@ impl AIProvider {
 	/// Anthropic Platform provider carries the conformance evidence the
 	/// allowlist models were verified against. Bedrock serving
 	/// Anthropic-Messages wire format is deliberately NOT enough (a Mantle
-	/// leg accepts the request but silently eager-loads deferred tools).
+	/// leg accepts the request but silently eager-loads deferred tools), and
+	/// generic Anthropic API compatibility is never taken as evidence of
+	/// Tool Search semantics (2026-10-20 Fireworks conformance: shapes are
+	/// tolerated but the search tool never executes).
 	pub fn provider_serves_native_tool_search(&self) -> bool {
 		matches!(self, AIProvider::Anthropic(_))
-			|| (provider_kind_probe_enabled() && self.is_anthropic_compatible_probe_kind())
-	}
-
-	/// Controlled stage-only conformance probe (2026-10-20 Phase 4): when
-	/// AGENTGATEWAY_TOOL_SEARCH_PROVIDER_PROBE=true, custom-provider legs
-	/// with an explicit Anthropic-Messages output format (the Fireworks and
-	/// OpenRouter claude listeners) are allowed to receive native Tool
-	/// Search shapes so the provider's REAL behavior can be observed for the
-	/// conformance matrix. Never enabled in production; the entry allowlist
-	/// must ALSO name the model and the per-attempt output-format guard
-	/// still applies.
-	fn is_anthropic_compatible_probe_kind(&self) -> bool {
-		matches!(self, AIProvider::Custom(_))
 	}
 
 	pub async fn process_messages_request(
@@ -1829,12 +1819,15 @@ impl AIProvider {
 			info!(
 				tool_search.decision = "downgraded-eager",
 				tool_search.decision_reason = decision.reason,
+				tool_search.policy_revision = decision.policy_revision.as_deref().unwrap_or("env-only"),
 				tool_search.removed_server_tools = report.removed_server_tools,
 				tool_search.removed_builtin_server_tools = report.removed_builtin_server_tools,
 				tool_search.stripped_defer_loading = report.stripped_defer_loading,
 				tool_search.removed_tool_references = report.removed_tool_references,
 				tool_search.removed_search_rounds = report.removed_search_rounds,
 				tool_search.hoisted_schemas = report.hoisted_schemas,
+				tool_search.hoisted_schema_conflicts = report.hoisted_schema_conflicts,
+				tool_search.translated_builtin_rounds = report.translated_builtin_rounds,
 				tool_search.neutralized_tool_choice = report.neutralized_tool_choice,
 				"tool search downgraded to eager tool loading for unverified model"
 			);
@@ -3497,15 +3490,6 @@ fn anthropic_toolsearch_incompatible(upstream: &str) -> ::http::Response<Body> {
 		.header(::http::header::CONTENT_TYPE, "application/json")
 		.body(Body::from(body.to_string()))
 		.expect("failed to build anthropic error response")
-}
-
-/// Stage-only conformance probe switch (default OFF everywhere): lets
-/// custom-provider Anthropic-Messages legs receive native Tool Search shapes
-/// for the Phase 4 Fireworks conformance matrix. See
-/// `AIProvider::is_anthropic_compatible_probe_kind`.
-fn provider_kind_probe_enabled() -> bool {
-	std::env::var("AGENTGATEWAY_TOOL_SEARCH_PROVIDER_PROBE")
-		.is_ok_and(|value| value.trim() == "true")
 }
 
 /// Models whose native Tool Search (deferred tool loading) this gateway is
