@@ -302,6 +302,24 @@ mod tests {
 		assert!(ToolSearchPolicyDoc::parse(big.as_bytes()).is_err());
 	}
 
+	#[test]
+	fn parses_generated_control_plane_artifact_when_provided() {
+		// Bridge check for the CP->gateway vertical slice: point
+		// TOOLSEARCH_POLICY_FIXTURE at an artifact emitted by
+		// scripts/llm-gateway/generate-toolsearch-policy.ts and the REAL
+		// parser must accept it. Skipped when the variable is unset (normal
+		// CI); wired into the release runbook.
+		let Ok(path) = std::env::var("TOOLSEARCH_POLICY_FIXTURE") else {
+			return;
+		};
+		let bytes = std::fs::read(&path)
+			.unwrap_or_else(|error| panic!("fixture {path} unreadable: {error}"));
+		let doc = ToolSearchPolicyDoc::parse(&bytes)
+			.unwrap_or_else(|error| panic!("generated artifact must parse: {error}"));
+		assert!(!doc.revision.trim().is_empty());
+		assert!(!doc.models.is_empty());
+	}
+
 	#[tokio::test]
 	async fn decision_matrix_env_and_artifact_two_key() {
 		// Both policy-mutating tests share the crate's global test lock so
