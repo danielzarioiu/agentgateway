@@ -97,12 +97,18 @@ impl Request {
 			}
 			let server_tools = tools.len();
 			tools.retain(|tool| {
-				tool
+				let tool_type = tool
 					.get("type")
 					.and_then(serde_json::Value::as_str)
-					.is_none_or(|tool_type| !tool_type.starts_with("tool_search"))
+					.unwrap_or_default();
+				if is_builtin_server_tool(tool_type) {
+					report.removed_builtin_server_tools += 1;
+					false
+				} else {
+					!tool_type.starts_with("tool_search")
+				}
 			});
-			report.removed_server_tools = server_tools - tools.len();
+			report.removed_server_tools = server_tools - tools.len() - report.removed_builtin_server_tools;
 		}
 
 		let mut hoisted: Vec<serde_json::Value> = Vec::new();
@@ -206,11 +212,46 @@ impl Request {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ToolSearchDowngrade {
 	pub removed_server_tools: usize,
+	pub removed_builtin_server_tools: usize,
 	pub stripped_defer_loading: usize,
 	pub removed_tool_references: usize,
 	pub removed_search_rounds: usize,
 	pub hoisted_schemas: usize,
 	pub neutralized_tool_choice: bool,
+}
+
+/// Anthropic built-in server tools — executed provider-side (web search,
+/// web fetch, code execution), not client function calling. Third-party
+/// Anthropic-compatible providers reject these tool types outright
+/// (2026-10-20: Fireworks answered `web_search_20250329` with HTTP 400 in
+/// 13 ms and the client recovered by silently retrying without it), so for
+/// models without verified native support the downgrade removes them instead
+/// of gambling on every client implementing the same recovery.
+fn is_builtin_server_tool(tool_type: &str) -> bool {
+	tool_type.starts_with("web_search")
+		|| tool_type.starts_with("web_fetch")
+		|| tool_type.starts_with("code_execution")
+}
+
+impl Request {
+	/// Whether the `tools` array offers any Anthropic built-in server tool
+	/// (`web_search*` / `web_fetch*` / `code_execution*`). Used as an
+	/// additional entry-time trigger for the eager downgrade on models
+	/// without verified native support — these requests carry no Tool Search
+	/// shapes at all, so TS detection alone would forward the unsupported
+	/// tool and leave the failure to the upstream.
+	pub fn offers_builtin_server_tools(&self) -> bool {
+		self.rest
+			.get("tools")
+			.and_then(|t| t.as_array())
+			.is_some_and(|items| {
+				items.iter().any(|tool| {
+					tool.get("type")
+						.and_then(serde_json::Value::as_str)
+						.is_some_and(is_builtin_server_tool)
+				})
+			})
+	}
 }
 
 /// Extract a full eager tool definition from a `tool_reference` block that
@@ -2318,6 +2359,44 @@ mod tests {
 				.iter()
 				.any(|p| p["type"].as_str() == Some("tool_result")),
 			"the ordinary tool round must stay in history"
+		);
+	}
+
+	#[test]
+	fn builtin_web_search_is_removed_by_downgrade() {
+		// 2026-10-20 incident class C: Claude Desktop sends its integrated
+		// `web_search` server tool alongside ordinary tools; Fireworks
+		// rejects the unknown tool type with HTTP 400 in 13 ms and Desktop
+		// recovered only by silently retrying without it. The downgrade must
+		// remove the built-in server tool deterministically (telemetry
+		// carries the count) while keeping every ordinary tool.
+		let body = serde_json::json!({
+			"model": "glm-5p3-flash",
+			"max_tokens": 64,
+			"messages": [{"role": "user", "content": "prezzo dell'oro"}],
+			"tools": [
+				{"type": "web_search_20250329", "name": "web_search"},
+				{"name": "get_weather", "description": "Get the weather", "input_schema": {"type": "object"}},
+				{"type": "code_execution_20250522", "name": "code"}
+			]
+		});
+		let mut req = parse_request(body);
+		assert!(
+			req.offers_builtin_server_tools(),
+			"web_search must be detected without any TS shapes"
+		);
+		assert!(!req.uses_native_tool_search());
+		let report = req.downgrade_tool_search();
+		assert_eq!(report.removed_builtin_server_tools, 2);
+		assert_eq!(report.removed_server_tools, 0, "tool_search family is separate");
+		let serialized = serde_json::to_value(&req).unwrap();
+		let tools = serialized["tools"].as_array().unwrap();
+		assert_eq!(tools.len(), 1, "ordinary tool stays: {serialized}");
+		assert_eq!(tools[0]["name"].as_str(), Some("get_weather"));
+		assert!(
+			!serialized.to_string().contains("web_search")
+				&& !serialized.to_string().contains("code_execution"),
+			"no built-in server tool may survive: {serialized}"
 		);
 	}
 

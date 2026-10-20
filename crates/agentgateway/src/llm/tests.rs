@@ -4526,6 +4526,49 @@ async fn verified_model_toolsearch_on_bedrock_mantle_is_rejected() {
 }
 
 #[tokio::test]
+async fn builtin_web_search_only_request_is_downgraded_for_unverified_model() {
+	// 2026-10-20 class C entry gate: a request carrying ONLY Anthropic
+	// built-in server tools (no Tool Search shapes at all) on an unverified
+	// model must trigger the downgrade too — otherwise the web_search tool
+	// forwards verbatim and the upstream 400s, leaving the outcome to the
+	// client's retry-and-recover.
+	let _env = ScopedToolSearchEnv::allow("claude-sonnet-5-5").await;
+	let provider = AIProvider::Anthropic(anthropic::Provider {
+		model_override: None,
+	});
+	let body = json!({
+		"model": "glm-5p3-flash",
+		"max_tokens": 64,
+		"stream": true,
+		"messages": [{"role": "user", "content": "prezzo dell'oro"}],
+		"tools": [
+			{"type": "web_search_20250329", "name": "web_search"},
+			{"name": "get_weather", "description": "Get the weather", "input_schema": {"type": "object"}}
+		]
+	});
+	let result = process_toolsearch_messages(&provider, body).await.unwrap();
+	let RequestResult::Success { request, .. } = result else {
+		panic!("web_search-only request must downgrade and convert, got {result:?}");
+	};
+	let rendered: Value = {
+		let bytes = http_body_util::BodyExt::collect(request.into_body())
+			.await
+			.unwrap()
+			.to_bytes();
+		serde_json::from_slice(&bytes).unwrap()
+	};
+	let rendered_str = rendered.to_string();
+	assert!(
+		!rendered_str.contains("web_search"),
+		"built-in server tool must not reach the upstream: {rendered}"
+	);
+	assert!(
+		rendered_str.contains("get_weather"),
+		"ordinary tools must survive: {rendered}"
+	);
+}
+
+#[tokio::test]
 async fn unverified_model_toolsearch_is_downgraded_to_ordinary_tools() {
 	// The allowlist names a DIFFERENT model: this one's Tool Search shapes must
 	// be downgraded before routing, so the request converts cleanly to OpenAI

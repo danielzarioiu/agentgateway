@@ -1792,7 +1792,15 @@ impl AIProvider {
 		// equivalent; anything it cannot translate keeps the strict guard
 		// below (defense in depth).
 		let mut native_tool_search = req.uses_native_tool_search();
-		if native_tool_search && !tool_search_model_allowed(req.model.as_deref().unwrap_or_default()) {
+		// Models without verified native support also cannot serve Anthropic
+		// built-in server tools (web_search/web_fetch/code_execution):
+		// third-party providers reject those tool types outright (Fireworks
+		// 400, 2026-10-20). Downgrade those requests too — removal with
+		// telemetry beats relying on every client's retry-and-recover.
+		let has_builtin_server_tools = req.offers_builtin_server_tools();
+		if !tool_search_model_allowed(req.model.as_deref().unwrap_or_default())
+			&& (native_tool_search || has_builtin_server_tools)
+		{
 			let report = req.downgrade_tool_search();
 			strip_tool_search_beta_headers(&mut parts.headers);
 			// Sanitized decision telemetry (counts only, never tool names or
@@ -1801,6 +1809,7 @@ impl AIProvider {
 			info!(
 				tool_search.decision = "downgraded-eager",
 				tool_search.removed_server_tools = report.removed_server_tools,
+				tool_search.removed_builtin_server_tools = report.removed_builtin_server_tools,
 				tool_search.stripped_defer_loading = report.stripped_defer_loading,
 				tool_search.removed_tool_references = report.removed_tool_references,
 				tool_search.removed_search_rounds = report.removed_search_rounds,
