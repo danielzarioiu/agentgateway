@@ -7,6 +7,7 @@ use super::super::typesafe::{
 	Answer, ModelVerification, TypeSafeClient, TypeSafeConfig, TypeSafeError,
 };
 use super::*;
+use crate::llm::safeguards::SafeguardsConfig;
 
 const FIXTURES: &str = include_str!("fixtures/safety-eval-v1.json");
 const ADVERSARIAL: &str = include_str!("fixtures/safety-eval-adversarial-v1.json");
@@ -916,8 +917,10 @@ fn env_flag(name: &str) -> bool {
 /// `AGENTGATEWAY_SAFEGUARDS_LIVE_EVAL=1` and `TYPESAFE_API_KEY` are set.
 ///
 /// Environment:
-/// - `TYPESAFE_MODEL`         requested model name (default `jev-1.14.0`); it
-///   must be listed by `GET /v1/models` verbatim — never substituted;
+/// - `TYPESAFE_MODEL`         requested model name (default `jev-1.14.0`).
+///   Versioned IDs verify by inference even when `GET /v1/models` (aliases
+///   only) does not list them; an alias request MUST pin the concrete version
+///   via `TYPESAFE_EXPECT_MODEL` or the run refuses to start;
 /// - `TYPESAFE_EXPECT_MODEL`  exact name every answer must report (default:
 ///   the requested name); a mismatch fails the run;
 /// - `TYPESAFE_BASE_URL`      default `https://api.typesafe.ai`;
@@ -973,15 +976,40 @@ async fn live_typesafe_safety_eval() {
 	})
 	.expect("client");
 
-	let verification: ModelVerification = client.verify_model().await.expect("models verification");
+	// An alias can never pin itself: refuse before any provider call.
+	let expect_pinned_explicitly = std::env::var("TYPESAFE_EXPECT_MODEL").is_ok();
+	if !SafeguardsConfig::is_versioned_model(&requested_model) && !expect_pinned_explicitly {
+		panic!(
+			"TYPESAFE_MODEL is an alias ({requested_model}); set TYPESAFE_EXPECT_MODEL to the concrete version to pin — an alias can never be verified by itself"
+		);
+	}
+
+	// Advisory evidence first: the account listing (aliases only), then the
+	// verification probe — the same minimal synthetic inference the gateway
+	// uses, which must answer exactly as the pinned version.
+	let listed: Vec<String> = match client.list_models().await {
+		Ok(models) => models.into_iter().map(|m| m.name).collect(),
+		Err(error) => {
+			eprintln!("LIVE EVAL: GET /v1/models failed (advisory only): {error}");
+			Vec::new()
+		},
+	};
+	let probe: ModelVerification = client
+		.verify_model(&expect_model)
+		.await
+		.expect("verification probe: the pinned model must answer exactly");
 	eprintln!(
-		"LIVE EVAL: requested={} expect={} listed={:?} available={}",
-		verification.requested, expect_model, verification.listed, verification.available
+		"LIVE EVAL: probe verified requested={} resolved={} latency_ms={} in={} out={} listed_aliases={:?}",
+		probe.requested,
+		probe.resolved,
+		probe.latency.as_millis(),
+		probe.input_tokens,
+		probe.output_tokens,
+		listed
 	);
-	assert!(
-		verification.available,
-		"model {} is not served; listed: {:?} — never substitute an alias",
-		verification.requested, verification.listed
+	assert_eq!(
+		probe.resolved, expect_model,
+		"the provider answered as a different model; never substitute"
 	);
 
 	let mut records: Vec<LiveRecord> = Vec::new();
@@ -1158,7 +1186,7 @@ async fn live_typesafe_safety_eval() {
 		"rubric": RUBRIC_VERSION,
 		"requested_model": requested_model,
 		"expect_model": expect_model,
-		"listed_models": verification.listed,
+		"listed_models": listed,
 		"sets": sets,
 		"jev_all": jev_all,
 		"calls": calls,

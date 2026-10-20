@@ -28,8 +28,11 @@ struct MockClassifier {
 	model_name: String,
 	script: Mutex<VecDeque<Result<BTreeMap<String, Answer>, TypeSafeError>>>,
 	calls: AtomicUsize,
-	/// `Ok(true)` = listed, `Ok(false)` = not listed, `Err` = probe failure.
-	verify: Mutex<Result<bool, TypeSafeError>>,
+	/// Probe script: `Ok(resolved)` = the verification probe answered as
+	/// `resolved`; `None` = answer as `model_name`; `Err` = probe failure.
+	verify: Mutex<Option<Result<String, TypeSafeError>>>,
+	verify_calls: AtomicUsize,
+	last_probe_expected: Mutex<Option<String>>,
 }
 
 impl MockClassifier {
@@ -42,7 +45,9 @@ impl MockClassifier {
 			model_name: "mock-1.0".to_string(),
 			script: Mutex::new(script.into_iter().collect()),
 			calls: AtomicUsize::new(0),
-			verify: Mutex::new(Ok(true)),
+			verify: Mutex::new(None),
+			verify_calls: AtomicUsize::new(0),
+			last_probe_expected: Mutex::new(None),
 		}
 	}
 
@@ -52,13 +57,20 @@ impl MockClassifier {
 		self
 	}
 
-	fn verifying(self, result: Result<bool, TypeSafeError>) -> Self {
-		self.set_verify(result);
-		self
+	fn set_verify(&self, result: Result<String, TypeSafeError>) {
+		*self.verify.lock().expect("verify mutex") = Some(result);
 	}
 
-	fn set_verify(&self, result: Result<bool, TypeSafeError>) {
-		*self.verify.lock().expect("verify mutex") = result;
+	fn verify_calls(&self) -> usize {
+		self.verify_calls.load(Ordering::SeqCst)
+	}
+
+	fn last_probe_expected(&self) -> Option<String> {
+		self
+			.last_probe_expected
+			.lock()
+			.expect("probe mutex")
+			.clone()
 	}
 
 	fn answers_all_low() -> BTreeMap<String, Answer> {
@@ -149,19 +161,26 @@ impl Classifier for MockClassifier {
 		}
 	}
 
-	async fn verify(&self) -> Result<ModelVerification, TypeSafeError> {
-		match self.verify.lock().expect("verify mutex").clone() {
-			Ok(available) => Ok(ModelVerification {
-				requested: "mock-1.0".to_string(),
-				available,
-				listed: if available {
-					vec!["mock-1.0".to_string()]
-				} else {
-					vec!["mock-latest".to_string()]
-				},
-			}),
-			Err(error) => Err(error),
+	async fn verify(&self, expected: &str) -> Result<ModelVerification, TypeSafeError> {
+		self.verify_calls.fetch_add(1, Ordering::SeqCst);
+		*self.last_probe_expected.lock().expect("probe mutex") = Some(expected.to_string());
+		let resolved = match self.verify.lock().expect("verify mutex").clone() {
+			Some(result) => result?,
+			None => self.model_name.clone(),
+		};
+		if resolved != expected {
+			return Err(TypeSafeError::ModelMismatch {
+				expected: expected.to_string(),
+				resolved,
+			});
 		}
+		Ok(ModelVerification {
+			requested: self.model_name.clone(),
+			resolved,
+			latency: Duration::from_millis(3),
+			input_tokens: 96,
+			output_tokens: 4,
+		})
 	}
 }
 
@@ -346,11 +365,30 @@ fn config_parses_env_and_reports_misconfiguration() {
 	]);
 	assert_eq!(config.model, "jev-latest");
 	assert_eq!(config.expected_model(), "jev-1.14.0");
+	assert!(!config.model_pin_required());
+	assert!(
+		!config.model_is_versioned(),
+		"the request name is still an alias"
+	);
 	let (config, _) = lookup(&[("AGENTGATEWAY_SAFEGUARDS_MODEL", "jev-1.14.0")]);
 	assert_eq!(
 		config.expected_model(),
 		"jev-1.14.0",
 		"without an explicit pin the requested name is the pin"
+	);
+	assert!(config.model_is_versioned());
+	assert!(!config.model_pin_required());
+
+	// An alias without an explicit pin can never be verified: warn up front.
+	let (_, warnings) = lookup(&[
+		("AGENTGATEWAY_SAFEGUARDS_MODE", "shadow"),
+		("AGENTGATEWAY_SAFEGUARDS_MODEL", "jev-latest"),
+		("AGENTGATEWAY_SAFEGUARDS_ROUTES", "zai.glm-5.3"),
+		("AGENTGATEWAY_SAFEGUARDS_IDENTITIES", "user-pilot"),
+	]);
+	assert!(
+		warnings.iter().any(|w| w.contains("model_pin_required")),
+		"alias without EXPECT_MODEL must warn: {warnings:?}"
 	);
 }
 
@@ -1256,27 +1294,113 @@ fn decision_metrics_are_counted() {
 // ---------------------------------------------------------------------------
 
 /// Exact sanitized body returned by `GET /v1/models` for the pilot account on
-/// 2026-10-20: only aliases are listed. The pinned version must NOT verify
-/// against it — an alias is never a substitute.
+/// 2026-10-20: only aliases are listed. Per the official model docs
+/// (docs.typesafe.ai/models) the listing is advisory: versioned IDs such as
+/// `jev-1.14.0` are accepted by the `model` field whether or not they appear,
+/// `jev-latest` maps to `jev-1.13.0` and `jev-preview` maps to `jev-1.14.0`.
 const LIVE_MODELS_LISTING_2026_10_20: &str = r#"{"models":[{"name":"jev-latest","description":"The latest iteration of TypeSafe's System One Model: Jev","release_date":"2026-09-10T18:38:01.391457+00:00"},{"name":"jev-preview","description":"A preview version of `jev-latest`: should be better in most ways","release_date":"2026-09-10T18:39:06.057655+00:00"}]}"#;
 
 #[test]
-fn live_models_listing_never_verifies_an_unlisted_pin() {
+fn models_listing_is_advisory_and_version_pins_are_recognized() {
 	let listing: ModelMetadataList =
 		serde_json::from_str(LIVE_MODELS_LISTING_2026_10_20).expect("real listing parses");
 	assert_eq!(listing.models.len(), 2);
-	let pinned = ModelVerification::from_listing("jev-1.14.0", listing.models.clone());
-	assert!(!pinned.available, "{pinned:?}");
-	assert_eq!(pinned.listed, vec!["jev-latest", "jev-preview"]);
-	let alias = ModelVerification::from_listing("jev-latest", listing.models.clone());
-	assert!(alias.available, "a listed alias verifies as requested");
-	assert!(
-		!ModelVerification::from_listing("JEV-LATEST", listing.models.clone()).available,
-		"case-sensitive"
+	// The listed names are aliases: no dotted version, so they cannot pin
+	// themselves — they verify only through an explicit EXPECT_MODEL.
+	for name in listing.models.iter().map(|m| m.name.as_str()) {
+		assert!(
+			!SafeguardsConfig::is_versioned_model(name),
+			"{name} must classify as an alias"
+		);
+	}
+	// …while a versioned ID carries its pin in the name itself.
+	assert!(SafeguardsConfig::is_versioned_model("jev-1.14.0"));
+	assert!(SafeguardsConfig::is_versioned_model("mock-1.0"));
+	assert!(!SafeguardsConfig::is_versioned_model("jev"));
+	assert!(!SafeguardsConfig::is_versioned_model(""));
+}
+
+#[tokio::test]
+async fn unlisted_versioned_pin_verifies_through_inference_probe() {
+	let mock = Arc::new(MockClassifier::ok(MockClassifier::answers_all_low()));
+	// The provider echoes the requested versioned name back.
+	mock.set_verify(Ok("mock-2.1.0".to_string()));
+	let config = SafeguardsConfig {
+		// A concrete version no listing advertises — accepted by the provider
+		// per the official model docs.
+		model: "mock-2.1.0".to_string(),
+		..pilot_config(Mode::Enforce)
+	};
+	let _guard = RuntimeGuard::install_unverified(config, Some(mock.clone()));
+	assert_eq!(
+		verify_once(mock.as_ref()).await,
+		Verification::Verified,
+		"a versioned pin verifies by inference even though no listing shows it"
 	);
-	assert!(
-		!ModelVerification::from_listing("jev", listing.models).available,
-		"no prefix resolution"
+	assert_eq!(runtime().verification(), Verification::Verified);
+	assert_eq!(mock.verify_calls(), 1, "verification is an inference probe");
+	assert_eq!(
+		mock.calls(),
+		0,
+		"the probe is synthetic: the classification payload is never touched"
+	);
+	assert_eq!(
+		mock.last_probe_expected().as_deref(),
+		Some("mock-2.1.0"),
+		"a versioned pin requires its own name"
+	);
+}
+
+#[tokio::test]
+async fn probe_answered_by_another_version_fails_closed() {
+	let mock = Arc::new(MockClassifier::ok(MockClassifier::answers_all_low()));
+	mock.set_verify(Ok("mock-2.0".to_string()));
+	let _guard = RuntimeGuard::install_unverified(pilot_config(Mode::Enforce), Some(mock.clone()));
+	assert_eq!(
+		verify_once(mock.as_ref()).await,
+		Verification::Failed {
+			label: "model_mismatch"
+		}
+	);
+	assert_eq!(runtime().verification().label(), "model_mismatch");
+}
+
+#[tokio::test]
+async fn alias_without_expected_version_never_probes() {
+	let mock = Arc::new(MockClassifier::ok(MockClassifier::answers_all_low()));
+	let config = SafeguardsConfig {
+		model: "mock-latest".to_string(),
+		..pilot_config(Mode::Enforce)
+	};
+	assert!(config.model_pin_required());
+	let guard = RuntimeGuard::install_unverified(config, Some(mock.clone()));
+	assert_eq!(
+		verify_once(mock.as_ref()).await,
+		Verification::Failed {
+			label: "model_pin_required"
+		}
+	);
+	assert_eq!(
+		mock.verify_calls(),
+		0,
+		"an unpinnable alias never reaches the provider"
+	);
+	drop(guard);
+
+	// Pinning the concrete version through EXPECT_MODEL unlocks verification,
+	// and the probe then requires exactly that version — never the alias.
+	let pinned = SafeguardsConfig {
+		model: "mock-latest".to_string(),
+		expect_model: Some("mock-1.0".to_string()),
+		..pilot_config(Mode::Enforce)
+	};
+	assert!(!pinned.model_pin_required());
+	let _guard = RuntimeGuard::install_unverified(pinned, Some(mock.clone()));
+	assert_eq!(verify_once(mock.as_ref()).await, Verification::Verified);
+	assert_eq!(
+		mock.last_probe_expected().as_deref(),
+		Some("mock-1.0"),
+		"the probe requires the pinned concrete version, not the alias"
 	);
 }
 
@@ -1372,6 +1496,13 @@ async fn evaluate_response_model_mismatch_fails_closed() {
 		})
 		.get();
 	assert_eq!(mismatches, 1);
+	assert_eq!(
+		runtime().verification(),
+		Verification::Failed {
+			label: "model_mismatch"
+		},
+		"request-time drift revokes verification until a clean probe passes"
+	);
 	drop(guard);
 
 	// Requesting an alias but pinning the concrete answering name is the
@@ -1398,15 +1529,17 @@ async fn evaluate_response_model_mismatch_fails_closed() {
 
 #[tokio::test]
 async fn verify_once_transitions_and_recovers() {
-	let mock = Arc::new(MockClassifier::ok(MockClassifier::answers_all_low()).verifying(Ok(false)));
+	let mock = Arc::new(MockClassifier::ok(MockClassifier::answers_all_low()));
+	// The probe is answered by an unexpected version: fail closed.
+	mock.set_verify(Ok("mock-9.9".to_string()));
 	let _guard = RuntimeGuard::install_unverified(pilot_config(Mode::Shadow), Some(mock.clone()));
 	assert_eq!(
 		verify_once(mock.as_ref()).await,
 		Verification::Failed {
-			label: "model_not_listed"
+			label: "model_mismatch"
 		}
 	);
-	assert_eq!(runtime().verification().label(), "model_not_listed");
+	assert_eq!(runtime().verification().label(), "model_mismatch");
 
 	mock.set_verify(Err(TypeSafeError::Transport("connect".to_string())));
 	assert_eq!(
@@ -1421,12 +1554,13 @@ async fn verify_once_transitions_and_recovers() {
 		}
 	);
 
-	mock.set_verify(Ok(true));
+	// The provider serves the pinned version again: recovery.
+	mock.set_verify(Ok("mock-1.0".to_string()));
 	assert_eq!(verify_once(mock.as_ref()).await, Verification::Verified);
 	assert_eq!(runtime().verification(), Verification::Verified);
 
-	// A later failure revokes verification again (the loop re-probes).
-	mock.set_verify(Ok(false));
+	// A later drift revokes verification again (the loop re-probes).
+	mock.set_verify(Ok("mock-9.9".to_string()));
 	verify_once(mock.as_ref()).await;
 	assert_ne!(runtime().verification(), Verification::Verified);
 	assert!(VERIFY_RETRY_MIN < VERIFY_RETRY_MAX && VERIFY_RETRY_MAX <= VERIFY_INTERVAL);

@@ -75,7 +75,10 @@ pub const DEFAULT_MAX_CONCURRENCY: usize = 8;
 pub const MAX_TOOL_USES_PER_TURN: usize = 32;
 /// Identity allowlist entry that admits every *authenticated* principal.
 pub const IDENTITY_WILDCARD: &str = "*";
-/// Re-verify the pinned model this often while it is verified.
+/// Idle poll while the model is verified. A verified model is NOT re-probed
+/// (verification is a billable inference): drift is caught per request by the
+/// exact `response.model` pin, which flips the state back to `Failed` and the
+/// probe loop recovers with backoff.
 pub const VERIFY_INTERVAL: Duration = Duration::from_secs(600);
 /// First retry delay after a failed verification; doubles up to the maximum.
 pub const VERIFY_RETRY_MIN: Duration = Duration::from_secs(15);
@@ -256,6 +259,12 @@ impl SafeguardsConfig {
 				"{ENV_API_KEY} is not set: allowlisted routes will answer `unsupported`"
 			));
 		}
+		if cfg.mode != Mode::Disabled && cfg.model_pin_required() {
+			warnings.push(format!(
+				"{ENV_MODEL} is an alias ({}) and {ENV_EXPECT_MODEL} is unset: the exact version cannot be pinned, verification fails closed (model_pin_required)",
+				cfg.model
+			));
+		}
 		(cfg, warnings)
 	}
 
@@ -266,6 +275,30 @@ impl SafeguardsConfig {
 	/// The exact model name every classifier response must report.
 	pub fn expected_model(&self) -> &str {
 		self.expect_model.as_deref().unwrap_or(&self.model)
+	}
+
+	/// Whether the configured model name carries an explicit dotted version
+	/// (`jev-1.14.0`) instead of an alias (`jev-latest`, `jev-preview`). Per
+	/// the official TypeSafe model docs, versioned IDs are accepted by the
+	/// `model` field whether or not the `/v1/models` listing (aliases only)
+	/// shows them.
+	pub fn model_is_versioned(&self) -> bool {
+		Self::is_versioned_model(&self.model)
+	}
+
+	/// A name counts as versioned when it contains a digit-dot-digit
+	/// sequence; provider aliases never do.
+	pub fn is_versioned_model(model: &str) -> bool {
+		let bytes = model.as_bytes();
+		(0..bytes.len().saturating_sub(2))
+			.any(|i| bytes[i].is_ascii_digit() && bytes[i + 1] == b'.' && bytes[i + 2].is_ascii_digit())
+	}
+
+	/// An alias request can only be pinned by an explicit expected version;
+	/// without one the exact model can never be verified and the feature
+	/// stays failed closed (`model_pin_required`).
+	pub fn model_pin_required(&self) -> bool {
+		!self.model_is_versioned() && self.expect_model.is_none()
 	}
 
 	pub fn route_allowed(&self, request_model: &str) -> bool {
@@ -335,7 +368,7 @@ pub trait Classifier: Send + Sync {
 		state: Value,
 		questions: BTreeMap<String, Question>,
 	) -> Result<SystemOneOutcome, TypeSafeError>;
-	async fn verify(&self) -> Result<ModelVerification, TypeSafeError>;
+	async fn verify(&self, expected: &str) -> Result<ModelVerification, TypeSafeError>;
 }
 
 #[async_trait::async_trait]
@@ -356,21 +389,24 @@ impl Classifier for TypeSafeClient {
 		TypeSafeClient::system_one(self, state, questions).await
 	}
 
-	async fn verify(&self) -> Result<ModelVerification, TypeSafeError> {
-		TypeSafeClient::verify_model(self).await
+	async fn verify(&self, expected: &str) -> Result<ModelVerification, TypeSafeError> {
+		TypeSafeClient::verify_model(self, expected).await
 	}
 }
 
-/// Whether the provider has confirmed it serves the pinned classifier model.
+/// Whether the provider has been proven to serve the pinned classifier model.
 /// Anything but `Verified` fails closed: the gateway answers `unsupported`
 /// (the client keeps its own classifier) and never calls the model.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verification {
 	/// Not probed yet (process start).
 	Pending,
-	/// `GET /v1/models` listed the requested model name exactly.
+	/// A synthetic inference probe answered exactly as the expected versioned
+	/// model. Versioned IDs verify even when absent from the `/v1/models`
+	/// listing; an alias never verifies merely by being listed.
 	Verified,
-	/// The probe failed or the model is not listed; retried in the background.
+	/// The probe failed (unreachable, unpinnable or wrong model); retried in
+	/// the background with backoff.
 	Failed { label: &'static str },
 }
 
@@ -463,26 +499,45 @@ pub fn init_from_env() -> SafeguardsConfig {
 	config
 }
 
-/// One verification probe (`GET /v1/models`): the requested model name must be
-/// listed exactly — an alias such as `jev-latest` is never accepted as a
-/// substitute for a pinned version. Records the outcome on the current runtime.
+/// One verification probe: a minimal SYNTHETIC System One inference (never
+/// user data) that must answer exactly as the expected versioned model. The
+/// `/v1/models` listing is advisory — TypeSafe serves versioned IDs that are
+/// absent from it — so availability is proven by inference, never by the
+/// listing, and an alias without `EXPECT_MODEL` can never pin a version (it
+/// fails closed without contacting the provider). Real user requests never
+/// verify anything: `evaluate` refuses the provider until this probe succeeds.
 pub async fn verify_once(classifier: &dyn Classifier) -> Verification {
-	let state = match classifier.verify().await {
-		Ok(verification) if verification.available => {
+	let config = runtime().config.clone();
+	if config.model_pin_required() {
+		warn!(
+			safeguards.model = %config.model,
+			"safeguards model is an alias without AGENTGATEWAY_SAFEGUARDS_EXPECT_MODEL; the exact version cannot be pinned, failing closed (model_pin_required)"
+		);
+		let state = Verification::Failed {
+			label: "model_pin_required",
+		};
+		runtime().set_verification(state.clone());
+		return state;
+	}
+	let expected = config.expected_model().to_string();
+	let state = match classifier.verify(&expected).await {
+		Ok(verification) if verification.resolved == expected => {
 			info!(
 				safeguards.model = %verification.requested,
-				"safeguards classifier model verified"
+				safeguards.resolved = %verification.resolved,
+				safeguards.latency_ms = verification.latency.as_millis() as u64,
+				"safeguards classifier model verified by synthetic inference probe"
 			);
 			Verification::Verified
 		},
 		Ok(verification) => {
 			warn!(
-				safeguards.model = %verification.requested,
-				safeguards.listed_models = ?verification.listed,
-				"safeguards classifier model is NOT listed by the provider; failing closed (unsupported), no alias substitution"
+				safeguards.expected_model = %expected,
+				safeguards.resolved_model = %verification.resolved,
+				"safeguards classifier probe answered as an unexpected model; failing closed (model_mismatch)"
 			);
 			Verification::Failed {
-				label: "model_not_listed",
+				label: "model_mismatch",
 			}
 		},
 		Err(error) => {
@@ -499,10 +554,13 @@ pub async fn verify_once(classifier: &dyn Classifier) -> Verification {
 	state
 }
 
-/// Background probe loop: verify the pinned model at startup, re-verify every
-/// `VERIFY_INTERVAL` while verified and retry with backoff while failed, so a
-/// transient outage of the provider's model listing recovers on its own. Only
-/// the safeguards capability depends on this; LLM inference never does.
+/// Background probe loop. Verification is a billable synthetic inference, so
+/// a verified model is NOT re-probed on a timer: drift is caught per request
+/// by the exact `response.model` pin, which flips the state back to `Failed`
+/// and lets this loop recover with backoff (recovery probes stay synthetic).
+/// An unpinnable alias configuration cannot heal by retrying, so it probes
+/// nothing. Only the safeguards capability depends on this; LLM inference
+/// never does.
 pub fn spawn_model_verification() {
 	let Some(classifier) = runtime().classifier() else {
 		return;
@@ -510,18 +568,21 @@ pub fn spawn_model_verification() {
 	tokio::spawn(async move {
 		let mut backoff = VERIFY_RETRY_MIN;
 		loop {
-			let delay = match verify_once(classifier.as_ref()).await {
-				Verification::Verified => {
-					backoff = VERIFY_RETRY_MIN;
-					VERIFY_INTERVAL
-				},
+			if runtime().verification() == Verification::Verified {
+				tokio::time::sleep(VERIFY_INTERVAL).await;
+				continue;
+			}
+			if runtime().config.model_pin_required() {
+				tokio::time::sleep(VERIFY_RETRY_MAX).await;
+				continue;
+			}
+			match verify_once(classifier.as_ref()).await {
+				Verification::Verified => backoff = VERIFY_RETRY_MIN,
 				_ => {
-					let delay = backoff;
+					tokio::time::sleep(backoff).await;
 					backoff = (backoff * 2).min(VERIFY_RETRY_MAX);
-					delay
 				},
-			};
-			tokio::time::sleep(delay).await;
+			}
 		}
 	});
 }
@@ -809,6 +870,12 @@ pub async fn evaluate(
 						safeguards.resolved_model = %outcome.response.model,
 						"safeguards classifier answered with a different model than pinned; failing closed (unsupported)"
 					);
+					// Revoke verification: the probe loop re-establishes it with a
+					// synthetic probe (with backoff) once the provider serves the
+					// pinned version again.
+					runtime().set_verification(Verification::Failed {
+						label: "model_mismatch",
+					});
 				},
 				Ok(outcome) => {
 					record_call(ctx, &provider, &model, "ok", Some(outcome.latency));

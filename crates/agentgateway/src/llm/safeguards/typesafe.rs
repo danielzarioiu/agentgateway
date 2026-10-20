@@ -188,27 +188,19 @@ pub struct SystemOneOutcome {
 	pub latency: Duration,
 }
 
-/// Result of `GET /v1/models` matched against the configured model name.
+/// Evidence from a successful verification probe: one minimal synthetic
+/// System One inference whose response reported the expected model exactly.
+/// Availability is proven by inference, not by the `/v1/models` listing,
+/// which only shows aliases.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelVerification {
+	/// Name requested in the probe (the configured model, alias or not).
 	pub requested: String,
-	/// Exact-name match. An alias such as `jev-latest` is never accepted as a
-	/// substitute for a pinned version.
-	pub available: bool,
-	pub listed: Vec<String>,
-}
-
-impl ModelVerification {
-	/// Pure matching rule over a model listing: the requested name must appear
-	/// verbatim (case-sensitive, no alias or prefix resolution).
-	pub fn from_listing(requested: &str, models: Vec<ModelMetadata>) -> Self {
-		let listed: Vec<String> = models.into_iter().map(|m| m.name).collect();
-		Self {
-			requested: requested.to_string(),
-			available: listed.iter().any(|name| name == requested),
-			listed,
-		}
-	}
+	/// Versioned model the response reported — equals the expected pin.
+	pub resolved: String,
+	pub latency: Duration,
+	pub input_tokens: u64,
+	pub output_tokens: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -505,11 +497,29 @@ impl TypeSafeClient {
 		Ok(parsed.models)
 	}
 
-	/// Verify the pinned model is served. Exact name match only — never
-	/// substitute an alias such as `jev-latest`.
-	pub async fn verify_model(&self) -> Result<ModelVerification, TypeSafeError> {
-		let models = self.list_models().await?;
-		Ok(ModelVerification::from_listing(&self.config.model, models))
+	/// Verify the pinned model with one minimal SYNTHETIC inference probe.
+	/// TypeSafe accepts versioned IDs such as `jev-1.14.0` whether or not
+	/// `GET /v1/models` (which lists aliases) shows them, so availability is
+	/// proven by inference: the probe passes only when the response reports
+	/// `expected` exactly. The probe payload is fixed smoke content — it never
+	/// carries user, repository or operational data.
+	pub async fn verify_model(&self, expected: &str) -> Result<ModelVerification, TypeSafeError> {
+		let outcome = self
+			.system_one(verification_state(), verification_questions())
+			.await?;
+		if outcome.response.model != expected {
+			return Err(TypeSafeError::ModelMismatch {
+				expected: expected.to_string(),
+				resolved: outcome.response.model,
+			});
+		}
+		Ok(ModelVerification {
+			requested: self.config.model.clone(),
+			resolved: outcome.response.model,
+			latency: outcome.latency,
+			input_tokens: outcome.response.usage.input_tokens,
+			output_tokens: outcome.response.usage.output_tokens,
+		})
 	}
 
 	fn transport_error(&self, error: reqwest::Error) -> TypeSafeError {
@@ -528,6 +538,34 @@ impl TypeSafeClient {
 		};
 		TypeSafeError::Transport(class.to_string())
 	}
+}
+
+/// Fixed synthetic smoke `state` for verification probes: the same shape as
+/// the classification `state` (see `policy::build_state`), contents inert.
+fn verification_state() -> Value {
+	serde_json::json!({
+		"rubric": "verification-probe",
+		"agent_environment": {"permission_mode": "probe"},
+		"conversation": [{"role": "user", "content": "Connectivity smoke test."}],
+		"conversation_truncated": false,
+		"tool_call": {"name": "Echo", "input": {"text": "probe"}},
+		"sibling_tool_calls_this_turn": [],
+	})
+}
+
+/// The probe's single question; the answer content is irrelevant — only the
+/// response `model` is checked.
+fn verification_questions() -> BTreeMap<String, Question> {
+	let mut questions = BTreeMap::new();
+	questions.insert(
+		"probe".to_string(),
+		Question::noul(
+			"Connectivity smoke test; the payload is inert.",
+			"This is a connectivity probe; answer yes.",
+			"Never answer no to the connectivity probe.",
+		),
+	);
+	questions
 }
 
 async fn read_bounded(
