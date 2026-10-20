@@ -749,6 +749,7 @@ impl RequestType for Request {
 			},
 			prompt: Default::default(),
 			provider_state: None,
+			safeguards: None,
 		};
 		Ok(llm)
 	}

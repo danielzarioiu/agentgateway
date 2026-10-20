@@ -2914,6 +2914,7 @@ mod tests {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
 		}
 	}
 
@@ -3036,6 +3037,7 @@ mod tests {
 				content: "hello".into(),
 			}])),
 			provider_state: None,
+			safeguards: None,
 		};
 		let mut context = LLMContext::from(request);
 		context.completion = Some(vec!["world".to_string()]);
@@ -3620,6 +3622,7 @@ mod tests {
 			params: llm::LLMRequestParams::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
 		};
 		let response = llm::LLMResponse {
 			input_tokens: Some(50),
@@ -3697,6 +3700,7 @@ mod tests {
 			params: llm::LLMRequestParams::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
 		};
 
 		let completeness = |response: llm::LLMResponse| -> Option<bool> {
@@ -3778,6 +3782,7 @@ mod tests {
 			params: llm::LLMRequestParams::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
 		};
 		let response = llm::LLMResponse {
 			input_tokens: Some(1_000_000),
