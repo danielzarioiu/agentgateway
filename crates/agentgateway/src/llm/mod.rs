@@ -40,6 +40,7 @@ pub const DEFAULT_BUFFER_LIMIT: usize = 32 * 1024 * 1024;
 pub mod catalog;
 pub mod discovery;
 pub mod policy;
+pub mod tool_search_policy;
 
 use policy::streaming_guardrails::GuardedSseBody;
 pub use types::{OutputMessage, OutputMessagePart, ToolCall};
@@ -1797,10 +1798,16 @@ impl AIProvider {
 		// third-party providers reject those tool types outright (Fireworks
 		// 400, 2026-10-20). Downgrade those requests too — removal with
 		// telemetry beats relying on every client's retry-and-recover.
+		//
+		// Mode resolution: env allowlist (deployment safety ceiling) ∩ the
+		// dynamic policy artifact when one is configured (background refresh,
+		// last-known-good; see tool_search_policy). `off` in the artifact
+		// forces the downgrade even for allowlisted models.
 		let has_builtin_server_tools = req.offers_builtin_server_tools();
-		if !tool_search_model_allowed(req.model.as_deref().unwrap_or_default())
-			&& (native_tool_search || has_builtin_server_tools)
-		{
+		let model_name = req.model.as_deref().unwrap_or_default();
+		let decision =
+			tool_search_policy::tool_search_decision(tool_search_model_allowed(model_name), model_name);
+		if !decision.allow_native && (native_tool_search || has_builtin_server_tools) {
 			let report = req.downgrade_tool_search();
 			strip_tool_search_beta_headers(&mut parts.headers);
 			// Sanitized decision telemetry (counts only, never tool names or
@@ -1808,6 +1815,7 @@ impl AIProvider {
 			// quantifies the history rewrite for observability.
 			info!(
 				tool_search.decision = "downgraded-eager",
+				tool_search.decision_reason = decision.reason,
 				tool_search.removed_server_tools = report.removed_server_tools,
 				tool_search.removed_builtin_server_tools = report.removed_builtin_server_tools,
 				tool_search.stripped_defer_loading = report.stripped_defer_loading,
