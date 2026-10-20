@@ -133,18 +133,15 @@ impl Request {
 			// hoisted earlier in this loop: the same deferred tool can embed
 			// its definition in more than one history block, and a duplicate
 			// tool name would make the upstream reject the whole request.
-			let mut known: Vec<String> = self
-				.rest
-				.get("tools")
-				.and_then(|t| t.as_array())
-				.map(|tools| {
-					tools
-						.iter()
-						.filter_map(|t| t.get("name").and_then(|n| n.as_str()))
-						.map(str::to_string)
-						.collect()
-				})
-				.unwrap_or_default();
+			//
+			// A name collision with a DIFFERENT schema is never resolved
+			// silently: identical definitions dedupe, but a divergent one is
+			// resolved by origin — a declared tool in THIS request is the
+			// client's current contract (it is what the client executes
+			// against), while between two hoisted history references the
+			// NEWEST reference wins (a mid-session tool upgrade). Either way
+			// `hoisted_schema_conflicts` counts the divergence so operators
+			// can see the downgrade had to choose between schemas.
 			let tools = self
 				.rest
 				.as_object_mut()
@@ -154,20 +151,42 @@ impl Request {
 				})
 				.and_then(|t| t.as_array_mut());
 			if let Some(tools) = tools {
+				#[derive(Clone, Copy, PartialEq)]
+				enum Origin {
+					Declared,
+					Hoisted,
+				}
+				let mut known: Vec<(String, usize, Origin)> = tools
+					.iter()
+					.enumerate()
+					.filter_map(|(index, tool)| {
+						tool.get("name")
+							.and_then(|n| n.as_str())
+							.map(|n| (n.to_string(), index, Origin::Declared))
+					})
+					.collect();
 				for definition in hoisted {
 					let name = definition
 						.get("name")
 						.and_then(|n| n.as_str())
 						.map(str::to_string);
-					if name
-						.as_deref()
-						.is_some_and(|n| known.iter().any(|k| k == n))
+					let Some(name) = name else {
+						tools.push(definition);
+						report.hoisted_schemas += 1;
+						continue;
+					};
+					if let Some(&(_, index, origin)) =
+						known.iter().find(|(known_name, _, _)| known_name == &name)
 					{
+						if tools[index] != definition {
+							report.hoisted_schema_conflicts += 1;
+							if origin == Origin::Hoisted {
+								tools[index] = definition;
+							}
+						}
 						continue;
 					}
-					if let Some(name) = name {
-						known.push(name);
-					}
+					known.push((name, tools.len(), Origin::Hoisted));
 					tools.push(definition);
 					report.hoisted_schemas += 1;
 				}
@@ -217,6 +236,17 @@ pub struct ToolSearchDowngrade {
 	pub removed_tool_references: usize,
 	pub removed_search_rounds: usize,
 	pub hoisted_schemas: usize,
+	/// Name collisions between hoisted history definitions that carried a
+	/// DIFFERENT schema (or between a hoisted definition and the request's
+	/// declared tool). Never resolved silently: counted here and resolved by
+	/// documented origin rules (declared wins over hoisted, newest hoisted
+	/// wins over older hoisted).
+	pub hoisted_schema_conflicts: usize,
+	/// Built-in server-tool rounds (web_search/web_fetch/code_execution use +
+	/// result blocks from an earlier native session) rewritten into neutral
+	/// text context so the upstream neither sees an executable server tool it
+	/// cannot run nor loses the conversation meaning.
+	pub translated_builtin_rounds: usize,
 	pub neutralized_tool_choice: bool,
 }
 
@@ -231,6 +261,83 @@ fn is_builtin_server_tool(tool_type: &str) -> bool {
 	tool_type.starts_with("web_search")
 		|| tool_type.starts_with("web_fetch")
 		|| tool_type.starts_with("code_execution")
+}
+
+/// Same families as [`is_builtin_server_tool`], matched against the `name`
+/// field of a history `server_tool_use` block (the block names the tool
+/// without its version suffix, e.g. `web_search`).
+fn is_builtin_server_tool_name(name: &str) -> bool {
+	name.starts_with("web_search") || name.starts_with("web_fetch") || name.starts_with("code_execution")
+}
+
+/// History result blocks of the built-in server tools (`web_search_tool_result`,
+/// `web_fetch_tool_result`, `code_execution_tool_result`).
+fn is_builtin_result_type(block_type: &str) -> bool {
+	block_type.starts_with("web_search_tool_result")
+		|| block_type.starts_with("web_fetch_tool_result")
+		|| block_type.starts_with("code_execution_tool_result")
+}
+
+/// Bounded UTF-8-safe truncation for translated history context.
+fn truncate_chars(value: &str, max_chars: usize) -> &str {
+	match value.char_indices().nth(max_chars) {
+		Some((index, _)) => &value[..index],
+		None => value,
+	}
+}
+
+/// Text replacement for a history built-in `server_tool_use` block: states
+/// plainly that the built-in ran in an earlier native session and is not
+/// available now, keeping a bounded copy of the invocation input as context.
+fn builtin_use_summary(name: &str, input: Option<&serde_json::Value>) -> String {
+	let mut text = format!(
+		"[built-in {name} invocation from an earlier native session — this model cannot run built-in server tools]"
+	);
+	if let Some(input) = input
+		&& let Ok(compact) = serde_json::to_string(input)
+	{
+		text.push_str(" input: ");
+		text.push_str(truncate_chars(&compact, 512));
+	}
+	text
+}
+
+/// Text replacement for a history built-in tool-result block: keeps titles,
+/// URLs and short text fields of the results as bounded context instead of an
+/// executable-looking server-tool payload (whose `encrypted_content` is
+/// undecryptable for third-party providers anyway).
+fn builtin_result_summary(block_type: &str, value: &serde_json::Value) -> String {
+	let mut text = format!("[{block_type} from an earlier native session]");
+	let Some(content) = value.get("content").and_then(|c| c.as_array()) else {
+		return text;
+	};
+	for part in content {
+		let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+		if part_type.ends_with("_result") || part_type == "text" {
+			let title = part.get("title").and_then(|t| t.as_str());
+			let url = part.get("url").and_then(|u| u.as_str());
+			let body = part.get("text").and_then(|t| t.as_str());
+			match (title, url) {
+				(Some(title), Some(url)) => {
+					text.push_str("\n- ");
+					text.push_str(truncate_chars(title, 160));
+					text.push_str(" — ");
+					text.push_str(truncate_chars(url, 200));
+				},
+				(_, Some(url)) => {
+					text.push_str("\n- ");
+					text.push_str(truncate_chars(url, 200));
+				},
+				_ => {
+					if let Some(body) = body {
+						text.push_str("\n- ");
+						text.push_str(truncate_chars(body, 240));
+					}
+				},
+			}
+		}
+	}
+	truncate_chars(&text, 2048).to_string()
 }
 
 impl Request {
@@ -298,16 +405,41 @@ fn sanitize_deferred_tool_parts(
 				parts.remove(index);
 			},
 			Some("server_tool_use") => {
-				let is_search = value
+				let name = value
 					.get("name")
 					.and_then(serde_json::Value::as_str)
-					.is_some_and(|name| name.starts_with("tool_search"));
-				if is_search {
+					.unwrap_or_default();
+				if name.starts_with("tool_search") {
 					report.removed_search_rounds += 1;
 					parts.remove(index);
+				} else if is_builtin_server_tool_name(name) {
+					// A built-in round from an earlier NATIVE session (e.g. the
+					// user switched models mid-session). The upstream cannot
+					// execute this server tool — forwarding the block verbatim
+					// would invite the model to emit another server_tool_use it
+					// cannot honor (a "successful" looking search that never
+					// runs). Keep the invocation as bounded text context.
+					let text = builtin_use_summary(name, value.get("input"));
+					parts[index] = ContentPart::Text {
+						r#type: "text".to_string(),
+						text,
+						rest: serde_json::Value::Null,
+					};
+					report.translated_builtin_rounds += 1;
+					index += 1;
 				} else {
 					index += 1;
 				}
+			},
+			Some(tool_result_type) if is_builtin_result_type(tool_result_type) => {
+				let text = builtin_result_summary(tool_result_type, value);
+				parts[index] = ContentPart::Text {
+					r#type: "text".to_string(),
+					text,
+					rest: serde_json::Value::Null,
+				};
+				report.translated_builtin_rounds += 1;
+				index += 1;
 			},
 			Some("tool_search_tool_result") => {
 				if let Some(content) = value.get("content").and_then(|c| c.as_array()) {
@@ -2446,6 +2578,145 @@ mod tests {
 			.filter_map(|t| t["name"].as_str())
 			.collect();
 		assert_eq!(names, vec!["mcp__example__list_widgets"], "{serialized}");
+	}
+
+	#[test]
+	fn hoisted_schema_conflict_keeps_newest_reference_and_counts() {
+		// A mid-session tool upgrade embeds a NEWER schema in a later history
+		// reference. The newest reference wins (it is the contract the client
+		// will execute against going forward), and the divergence is COUNTED —
+		// never resolved silently.
+		let older = serde_json::json!({
+			"type": "tool_reference",
+			"tool_name": "mcp__example__list_widgets",
+			"description": "List widgets",
+			"input_schema": {"type": "object", "properties": {"a": {"type": "string"}}}
+		});
+		let newer = serde_json::json!({
+			"type": "tool_reference",
+			"tool_name": "mcp__example__list_widgets",
+			"description": "List widgets (v2, paginated)",
+			"input_schema": {"type": "object", "properties": {"a": {"type": "string"}, "cursor": {"type": "string"}}}
+		});
+		let body = serde_json::json!({
+			"model": "glm-5p3",
+			"max_tokens": 64,
+			"messages": [
+				{"role": "user", "content": "find a tool"},
+				{"role": "assistant", "content": [
+					{"type": "server_tool_use", "id": "srvtoolu_1", "name": "tool_search", "input": {"query": "widgets"}},
+					{"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [older]},
+					{"type": "text", "text": "found it"}
+				]},
+				{"role": "user", "content": "again after the server restarted"},
+				{"role": "assistant", "content": [
+					{"type": "server_tool_use", "id": "srvtoolu_2", "name": "tool_search", "input": {"query": "widgets"}},
+					{"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_2", "content": [newer]},
+					{"type": "text", "text": "newer schema"}
+				]}
+			],
+			"tools": []
+		});
+		let mut req = parse_request(body);
+		let report = req.downgrade_tool_search();
+		assert_eq!(report.hoisted_schemas, 1, "{report:?}");
+		assert_eq!(report.hoisted_schema_conflicts, 1, "{report:?}");
+		let serialized = serde_json::to_value(&req).unwrap();
+		let tools = serialized["tools"].as_array().unwrap();
+		assert_eq!(tools.len(), 1, "{serialized}");
+		assert!(
+			tools[0]["description"]
+				.as_str()
+				.is_some_and(|d| d.contains("v2")),
+			"the NEWEST reference must win: {serialized}"
+		);
+	}
+
+	#[test]
+	fn hoisted_schema_conflict_against_declared_tool_keeps_declared() {
+		// The request's OWN tools array is the client's current contract; a
+		// stale history reference embedding an older schema must not override
+		// it, and the divergence is counted.
+		let stale = serde_json::json!({
+			"type": "tool_reference",
+			"tool_name": "get_weather",
+			"description": "Get the weather (old)",
+			"input_schema": {"type": "object"}
+		});
+		let body = serde_json::json!({
+			"model": "glm-5p3",
+			"max_tokens": 64,
+			"messages": [
+				{"role": "user", "content": "find a tool"},
+				{"role": "assistant", "content": [
+					{"type": "server_tool_use", "id": "srvtoolu_1", "name": "tool_search", "input": {"query": "weather"}},
+					{"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [stale]},
+					{"type": "text", "text": "found it"}
+				]}
+			],
+			"tools": [
+				{"name": "get_weather", "description": "Get the weather", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}
+			]
+		});
+		let mut req = parse_request(body);
+		let report = req.downgrade_tool_search();
+		assert_eq!(report.hoisted_schemas, 0, "{report:?}");
+		assert_eq!(report.hoisted_schema_conflicts, 1, "{report:?}");
+		let serialized = serde_json::to_value(&req).unwrap();
+		let tools = serialized["tools"].as_array().unwrap();
+		assert_eq!(tools.len(), 1, "{serialized}");
+		assert!(
+			tools[0]["input_schema"]["properties"]["city"].is_object(),
+			"the DECLARED definition must win: {serialized}"
+		);
+	}
+
+	#[test]
+	fn builtin_history_rounds_are_translated_to_neutral_text() {
+		// Mixed native→third-party session: the native leg executed the real
+		// web_search built-in, so history carries server_tool_use +
+		// web_search_tool_result blocks. Forwarding them verbatim invites the
+		// model to emit another server_tool_use it cannot honor (a search that
+		// looks successful but never runs). The downgrade rewrites both into
+		// bounded text context, keeping the search's meaning without the
+		// executable-looking blocks.
+		let body = serde_json::json!({
+			"model": "glm-5p3",
+			"max_tokens": 64,
+			"messages": [
+				{"role": "user", "content": "prezzo dell'oro"},
+				{"role": "assistant", "content": [
+					{"type": "server_tool_use", "id": "srvtoolu_ws", "name": "web_search", "input": {"query": "gold price"}},
+					{"type": "web_search_tool_result", "tool_use_id": "srvtoolu_ws", "content": [
+						{"type": "web_search_result", "title": "Gold spot price", "url": "https://example.com/gold"},
+						{"type": "web_search_result", "title": "Metals dashboard", "url": "https://example.com/metals"}
+					]},
+					{"type": "text", "text": "Gold is trading at $2,700/oz."}
+				]},
+				{"role": "user", "content": "e ora?"}
+			],
+			"tools": []
+		});
+		let mut req = parse_request(body);
+		let report = req.downgrade_tool_search();
+		assert_eq!(report.translated_builtin_rounds, 2, "{report:?}");
+		let serialized = serde_json::to_value(&req).unwrap();
+		let history = serialized.to_string();
+		assert!(
+			!history.contains("\"server_tool_use\"")
+				&& !history.contains("\"web_search_tool_result\""),
+			"no executable-looking server tool blocks may survive (the neutral text marker may name what it replaced): {serialized}"
+		);
+		assert!(
+			history.contains("gold price") && history.contains("example.com/gold"),
+			"the invocation and its results must stay as text context: {serialized}"
+		);
+		assert!(
+			history.contains("cannot run built-in server tools"),
+			"the marker must state plainly the tool is unavailable: {serialized}"
+		);
+		// The assistant text and the user turn stay intact.
+		assert!(history.contains("$2,700/oz."), "{serialized}");
 	}
 
 	#[test]
