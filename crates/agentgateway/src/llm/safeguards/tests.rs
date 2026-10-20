@@ -12,8 +12,8 @@ use secrecy::SecretString;
 use serde_json::{Value, json};
 
 use super::typesafe::{
-	Answer, ModelVerification, ProtocolFailure, SystemOneOutcome, SystemOneResponse, TypeSafeError,
-	Usage, classify_http_failure,
+	Answer, ModelMetadataList, ModelVerification, ProtocolFailure, SystemOneOutcome,
+	SystemOneResponse, TypeSafeError, Usage, classify_http_failure,
 };
 use super::*;
 use crate::telemetry::metrics::{
@@ -28,6 +28,8 @@ struct MockClassifier {
 	model_name: String,
 	script: Mutex<VecDeque<Result<BTreeMap<String, Answer>, TypeSafeError>>>,
 	calls: AtomicUsize,
+	/// `Ok(true)` = listed, `Ok(false)` = not listed, `Err` = probe failure.
+	verify: Mutex<Result<bool, TypeSafeError>>,
 }
 
 impl MockClassifier {
@@ -40,7 +42,23 @@ impl MockClassifier {
 			model_name: "mock-1.0".to_string(),
 			script: Mutex::new(script.into_iter().collect()),
 			calls: AtomicUsize::new(0),
+			verify: Mutex::new(Ok(true)),
 		}
+	}
+
+	/// Answers come back stamped with this model name (pin mismatch tests).
+	fn answering_as(mut self, model: &str) -> Self {
+		self.model_name = model.to_string();
+		self
+	}
+
+	fn verifying(self, result: Result<bool, TypeSafeError>) -> Self {
+		self.set_verify(result);
+		self
+	}
+
+	fn set_verify(&self, result: Result<bool, TypeSafeError>) {
+		*self.verify.lock().expect("verify mutex") = result;
 	}
 
 	fn answers_all_low() -> BTreeMap<String, Answer> {
@@ -132,11 +150,18 @@ impl Classifier for MockClassifier {
 	}
 
 	async fn verify(&self) -> Result<ModelVerification, TypeSafeError> {
-		Ok(ModelVerification {
-			requested: self.model_name.clone(),
-			available: true,
-			listed: vec![self.model_name.clone()],
-		})
+		match self.verify.lock().expect("verify mutex").clone() {
+			Ok(available) => Ok(ModelVerification {
+				requested: "mock-1.0".to_string(),
+				available,
+				listed: if available {
+					vec!["mock-1.0".to_string()]
+				} else {
+					vec!["mock-latest".to_string()]
+				},
+			}),
+			Err(error) => Err(error),
+		}
 	}
 }
 
@@ -149,7 +174,15 @@ struct RuntimeGuard {
 }
 
 impl RuntimeGuard {
+	/// Install with the pinned model already verified (the steady state).
 	fn install(config: SafeguardsConfig, classifier: Option<Arc<dyn Classifier>>) -> Self {
+		let guard = Self::install_unverified(config, classifier);
+		runtime().set_verification(Verification::Verified);
+		guard
+	}
+
+	/// Install exactly like process start: model verification still pending.
+	fn install_unverified(config: SafeguardsConfig, classifier: Option<Arc<dyn Classifier>>) -> Self {
 		let lock = RUNTIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 		install(config, classifier);
 		Self { _lock: lock }
@@ -185,6 +218,8 @@ fn work_context() -> Value {
 fn pilot_config(mode: Mode) -> SafeguardsConfig {
 	SafeguardsConfig {
 		mode,
+		// The mock answers as `mock-1.0`; the pin must match it.
+		model: "mock-1.0".to_string(),
 		routes: vec!["zai.glm*".to_string()],
 		identities: vec!["user-pilot".to_string()],
 		..SafeguardsConfig::default()
@@ -287,6 +322,12 @@ fn config_parses_env_and_reports_misconfiguration() {
 		("AGENTGATEWAY_SAFEGUARDS_ROUTES", "zai.glm-5.3"),
 	]);
 	assert!(warnings.iter().any(|w| w.contains("unsupported")));
+	assert!(
+		warnings
+			.iter()
+			.any(|w| w.contains("no principal is allowlisted")),
+		"active mode without identities must warn: {warnings:?}"
+	);
 
 	let (config, _) = lookup(&[
 		("AGENTGATEWAY_SAFEGUARDS_MODE", "enforce"),
@@ -296,6 +337,20 @@ fn config_parses_env_and_reports_misconfiguration() {
 		config.mode,
 		Mode::Disabled,
 		"unsupported provider forces disabled"
+	);
+
+	// Alias request pinned to one concrete answering model.
+	let (config, _) = lookup(&[
+		("AGENTGATEWAY_SAFEGUARDS_MODEL", "jev-latest"),
+		("AGENTGATEWAY_SAFEGUARDS_EXPECT_MODEL", " jev-1.14.0 "),
+	]);
+	assert_eq!(config.model, "jev-latest");
+	assert_eq!(config.expected_model(), "jev-1.14.0");
+	let (config, _) = lookup(&[("AGENTGATEWAY_SAFEGUARDS_MODEL", "jev-1.14.0")]);
+	assert_eq!(
+		config.expected_model(),
+		"jev-1.14.0",
+		"without an explicit pin the requested name is the pin"
 	);
 }
 
@@ -309,18 +364,99 @@ fn route_and_identity_matching() {
 	assert!(config.identity_allowed(Some("user-pilot")));
 	assert!(!config.identity_allowed(Some("user-other")));
 	assert!(!config.identity_allowed(None));
+	assert!(
+		!config.identity_allowed(Some("")),
+		"blank subject is not an identity"
+	);
+	assert!(
+		!config.identity_allowed(Some("USER-PILOT")),
+		"subjects match exactly"
+	);
 	let open = SafeguardsConfig {
 		mode: Mode::Shadow,
 		..SafeguardsConfig::default()
 	};
 	assert!(
-		open.identity_allowed(None),
-		"empty identities = every identity"
-	);
-	assert!(
 		!open.route_allowed("zai.glm-5.3"),
 		"empty routes = no route"
 	);
+}
+
+/// C1: the identity allowlist fails closed. An active mode with no allowlisted
+/// principal classifies nobody; an unauthenticated request never matches, not
+/// even with the explicit wildcard.
+#[test]
+fn identity_allowlist_fails_closed() {
+	for mode in [Mode::Shadow, Mode::Enforce] {
+		let empty = SafeguardsConfig {
+			mode,
+			routes: vec!["zai.glm*".to_string()],
+			identities: Vec::new(),
+			..SafeguardsConfig::default()
+		};
+		assert!(!empty.identity_allowed(Some("user-pilot")));
+		assert!(!empty.identity_allowed(None));
+		assert_eq!(
+			decide(&empty, true, false, "zai.glm-5.3", Some("user-pilot")),
+			Decision::Untouched("identity_denied"),
+			"{mode:?}: empty allowlist must not classify anyone"
+		);
+
+		let wildcard = SafeguardsConfig {
+			identities: vec![IDENTITY_WILDCARD.to_string()],
+			..empty.clone()
+		};
+		assert!(wildcard.identity_allowed(Some("anyone-authenticated")));
+		assert!(
+			!wildcard.identity_allowed(None),
+			"wildcard still requires an authenticated principal"
+		);
+		assert_eq!(
+			decide(&wildcard, true, false, "zai.glm-5.3", None),
+			Decision::Untouched("identity_denied")
+		);
+		assert_eq!(
+			decide(&wildcard, true, false, "zai.glm-5.3", Some("anyone")),
+			Decision::Classify {
+				shadow: mode == Mode::Shadow
+			}
+		);
+	}
+	// Disabled mode is untouched before any identity logic runs.
+	let disabled = SafeguardsConfig::default();
+	assert_eq!(
+		decide(&disabled, true, false, "zai.glm-5.3", None),
+		Decision::Untouched("disabled")
+	);
+	assert_eq!(
+		decide(&disabled, true, false, "zai.glm-5.3", Some("user-pilot")),
+		Decision::Untouched("disabled")
+	);
+}
+
+/// C1: the identity is the `sub` of the *verified* JWT only (the `Claims`
+/// extension is inserted by the JWT policy after signature validation).
+#[test]
+fn identity_comes_from_verified_jwt_sub_only() {
+	let claims = crate::http::jwt::Claims {
+		inner: serde_json::from_value(json!({
+			"sub": "6f1a0e2c-sub",
+			"preferred_username": "alice",
+			"email": "alice@example.test"
+		}))
+		.unwrap(),
+		jwt: SecretString::from("redacted".to_string()),
+	};
+	assert_eq!(
+		identity_from_claims(Some(&claims)).as_deref(),
+		Some("6f1a0e2c-sub")
+	);
+	let no_sub = crate::http::jwt::Claims {
+		inner: serde_json::from_value(json!({"email": "alice@example.test"})).unwrap(),
+		jwt: SecretString::from("redacted".to_string()),
+	};
+	assert_eq!(identity_from_claims(Some(&no_sub)), None);
+	assert_eq!(identity_from_claims(None), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -1113,4 +1249,230 @@ fn decision_metrics_are_counted() {
 			.get(),
 		2
 	);
+}
+
+// ---------------------------------------------------------------------------
+// Model pinning and verification (C3)
+// ---------------------------------------------------------------------------
+
+/// Exact sanitized body returned by `GET /v1/models` for the pilot account on
+/// 2026-10-20: only aliases are listed. The pinned version must NOT verify
+/// against it — an alias is never a substitute.
+const LIVE_MODELS_LISTING_2026_10_20: &str = r#"{"models":[{"name":"jev-latest","description":"The latest iteration of TypeSafe's System One Model: Jev","release_date":"2026-09-10T18:38:01.391457+00:00"},{"name":"jev-preview","description":"A preview version of `jev-latest`: should be better in most ways","release_date":"2026-09-10T18:39:06.057655+00:00"}]}"#;
+
+#[test]
+fn live_models_listing_never_verifies_an_unlisted_pin() {
+	let listing: ModelMetadataList =
+		serde_json::from_str(LIVE_MODELS_LISTING_2026_10_20).expect("real listing parses");
+	assert_eq!(listing.models.len(), 2);
+	let pinned = ModelVerification::from_listing("jev-1.14.0", listing.models.clone());
+	assert!(!pinned.available, "{pinned:?}");
+	assert_eq!(pinned.listed, vec!["jev-latest", "jev-preview"]);
+	let alias = ModelVerification::from_listing("jev-latest", listing.models.clone());
+	assert!(alias.available, "a listed alias verifies as requested");
+	assert!(
+		!ModelVerification::from_listing("JEV-LATEST", listing.models.clone()).available,
+		"case-sensitive"
+	);
+	assert!(
+		!ModelVerification::from_listing("jev", listing.models).available,
+		"no prefix resolution"
+	);
+}
+
+#[tokio::test]
+async fn evaluate_unverified_model_answers_unsupported_without_calls() {
+	let metrics = test_metrics();
+	let mock = Arc::new(MockClassifier::ok(MockClassifier::answers_all_low()));
+	let _guard = RuntimeGuard::install_unverified(pilot_config(Mode::Enforce), Some(mock.clone()));
+	assert_eq!(runtime().verification(), Verification::Pending);
+	let before = metrics
+		.safeguards_requests
+		.get_or_create(&SafeguardsRequestLabels {
+			decision: "model_unverified",
+		})
+		.get();
+
+	let results = evaluate(
+		&plan(work_context()),
+		&[bash_use("pnpm test")],
+		&ctx(Mode::Enforce, Some(metrics.clone())),
+	)
+	.await;
+	assert!(
+		matches!(results[0].status, SafeguardStatus::Unsupported),
+		"pending verification fails closed: {results:?}"
+	);
+	assert_eq!(
+		mock.calls(),
+		0,
+		"the provider is never called before verification"
+	);
+	assert_eq!(
+		metrics
+			.safeguards_requests
+			.get_or_create(&SafeguardsRequestLabels {
+				decision: "model_unverified",
+			})
+			.get(),
+		before + 1
+	);
+
+	runtime().set_verification(Verification::Failed {
+		label: "model_not_listed",
+	});
+	let results = evaluate(
+		&plan(work_context()),
+		&[bash_use("pnpm test")],
+		&ctx(Mode::Enforce, Some(metrics.clone())),
+	)
+	.await;
+	assert!(matches!(results[0].status, SafeguardStatus::Unsupported));
+	assert_eq!(mock.calls(), 0);
+
+	// Recovery: once verified, the same runtime classifies normally.
+	runtime().set_verification(Verification::Verified);
+	let results = evaluate(
+		&plan(work_context()),
+		&[bash_use("pnpm test")],
+		&ctx(Mode::Enforce, Some(metrics)),
+	)
+	.await;
+	assert_eq!(
+		available(&results)["toolu_1"],
+		ToolUseVerdict::not_flagged()
+	);
+	assert_eq!(mock.calls(), 1);
+}
+
+#[tokio::test]
+async fn evaluate_response_model_mismatch_fails_closed() {
+	let metrics = test_metrics();
+	// The provider answers as `mock-2.0` while the pin is `mock-1.0`.
+	let moved =
+		Arc::new(MockClassifier::ok(MockClassifier::answers_all_low()).answering_as("mock-2.0"));
+	let guard = RuntimeGuard::install(pilot_config(Mode::Enforce), Some(moved.clone()));
+	let results = evaluate(
+		&plan(work_context()),
+		&[bash_use("pnpm test")],
+		&ctx(Mode::Enforce, Some(metrics.clone())),
+	)
+	.await;
+	assert!(
+		matches!(results[0].status, SafeguardStatus::Unsupported),
+		"an answer from a different model never authorizes anything: {results:?}"
+	);
+	assert_eq!(moved.calls(), 1);
+	let mismatches = metrics
+		.safeguards_classifier_calls
+		.get_or_create(&crate::telemetry::metrics::SafeguardsCallLabels {
+			provider: "mock".to_string(),
+			model: "mock-2.0".to_string(),
+			result: "model_mismatch",
+		})
+		.get();
+	assert_eq!(mismatches, 1);
+	drop(guard);
+
+	// Requesting an alias but pinning the concrete answering name is the
+	// supported way to pin when the provider only lists aliases.
+	let pinned = SafeguardsConfig {
+		model: "mock-latest".to_string(),
+		expect_model: Some("mock-2.0".to_string()),
+		..pilot_config(Mode::Enforce)
+	};
+	let alias =
+		Arc::new(MockClassifier::ok(MockClassifier::answers_all_low()).answering_as("mock-2.0"));
+	let _guard = RuntimeGuard::install(pinned, Some(alias.clone()));
+	let results = evaluate(
+		&plan(work_context()),
+		&[bash_use("pnpm test")],
+		&ctx(Mode::Enforce, None),
+	)
+	.await;
+	assert_eq!(
+		available(&results)["toolu_1"],
+		ToolUseVerdict::not_flagged()
+	);
+}
+
+#[tokio::test]
+async fn verify_once_transitions_and_recovers() {
+	let mock = Arc::new(MockClassifier::ok(MockClassifier::answers_all_low()).verifying(Ok(false)));
+	let _guard = RuntimeGuard::install_unverified(pilot_config(Mode::Shadow), Some(mock.clone()));
+	assert_eq!(
+		verify_once(mock.as_ref()).await,
+		Verification::Failed {
+			label: "model_not_listed"
+		}
+	);
+	assert_eq!(runtime().verification().label(), "model_not_listed");
+
+	mock.set_verify(Err(TypeSafeError::Transport("connect".to_string())));
+	assert_eq!(
+		verify_once(mock.as_ref()).await,
+		Verification::Failed { label: "transport" }
+	);
+	mock.set_verify(Err(TypeSafeError::Unauthorized(401)));
+	assert_eq!(
+		verify_once(mock.as_ref()).await,
+		Verification::Failed {
+			label: "unauthorized"
+		}
+	);
+
+	mock.set_verify(Ok(true));
+	assert_eq!(verify_once(mock.as_ref()).await, Verification::Verified);
+	assert_eq!(runtime().verification(), Verification::Verified);
+
+	// A later failure revokes verification again (the loop re-probes).
+	mock.set_verify(Ok(false));
+	verify_once(mock.as_ref()).await;
+	assert_ne!(runtime().verification(), Verification::Verified);
+	assert!(VERIFY_RETRY_MIN < VERIFY_RETRY_MAX && VERIFY_RETRY_MAX <= VERIFY_INTERVAL);
+}
+
+#[tokio::test]
+async fn sse_stream_unverified_model_stamps_unsupported() {
+	let mock = Arc::new(MockClassifier::ok(MockClassifier::answers_dangerous()));
+	let _guard = RuntimeGuard::install_unverified(pilot_config(Mode::Enforce), Some(mock.clone()));
+	let events = stream_events(json!({
+		"type": "message_delta",
+		"delta": {"stop_reason": "tool_use", "stop_sequence": null},
+		"usage": {"output_tokens": 12}
+	}));
+	let inner = agent_http::RawBody::from_stream(futures_util::stream::iter(
+		encode_events(&events, 3)
+			.into_iter()
+			.map(Ok::<bytes::Bytes, axum_core::Error>),
+	));
+	let wrapped = super::stream::SafeguardsSseBody::new(
+		inner,
+		Arc::new(plan(work_context())),
+		ctx(Mode::Enforce, None),
+		64 * 1024,
+	);
+	let bytes = wrapped.collect().await.expect("collect").to_bytes();
+	let frames = parse_frames(&bytes);
+	let names: Vec<&str> = frames.iter().map(|(name, _)| name.as_str()).collect();
+	assert_eq!(names, EXPECTED_ORDER, "event order is still preserved");
+	let (_, delta) = frames
+		.iter()
+		.find(|(name, _)| name == "message_delta")
+		.expect("message_delta present");
+	assert_eq!(
+		delta["delta"]["safeguard_results"][0]["status"]["type"], "unsupported",
+		"the client falls back to its own classifier: {delta}"
+	);
+	assert_eq!(mock.calls(), 0);
+}
+
+#[test]
+fn model_mismatch_is_a_configuration_class_failure() {
+	let error = TypeSafeError::ModelMismatch {
+		expected: "jev-1.14.0".to_string(),
+		resolved: "jev-1.15.0".to_string(),
+	};
+	assert_eq!(error.protocol_failure(), ProtocolFailure::Unsupported);
+	assert_eq!(error.label(), "model_mismatch");
 }

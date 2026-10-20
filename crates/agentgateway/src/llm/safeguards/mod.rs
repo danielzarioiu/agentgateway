@@ -5,8 +5,10 @@
 //! request and response is byte-identical to a gateway without this module.
 //!
 //! Per attempt, the request side (`decide`) chooses one of:
-//! - untouched: feature disabled, no `safeguards` field, route or identity not
-//!   allowlisted — the request is forwarded exactly as today;
+//! - untouched: feature disabled, no `safeguards` field, route not allowlisted
+//!   or principal not allowlisted (the identity allowlist fails closed: an
+//!   empty list admits nobody, an unauthenticated request never matches) — the
+//!   request is forwarded exactly as today;
 //! - native pass-through: the attempt's provider is the Anthropic Platform,
 //!   which implements the protocol itself; nothing is touched;
 //! - classify: the `safeguards` field and the beta header are removed before
@@ -18,7 +20,9 @@
 //! The classifier result is a verdict, never an error on the agent's turn:
 //! failures become `unavailable` per tool use (transient) or `unsupported`
 //! (credential/model/configuration problems, so the client falls back to its
-//! own classifier).
+//! own classifier). The pinned model is verified against the provider's model
+//! listing before anything is classified and every answer must come from the
+//! pinned model name; otherwise the turn is `unsupported` (fail closed).
 
 pub mod policy;
 pub mod stream;
@@ -52,6 +56,10 @@ use crate::telemetry::metrics::{
 pub const ENV_MODE: &str = "AGENTGATEWAY_SAFEGUARDS_MODE";
 pub const ENV_PROVIDER: &str = "AGENTGATEWAY_SAFEGUARDS_PROVIDER";
 pub const ENV_MODEL: &str = "AGENTGATEWAY_SAFEGUARDS_MODEL";
+/// Exact model name every classifier response must report. Defaults to the
+/// requested model; set it when the requested name is an alias (e.g.
+/// `jev-latest`) that must stay pinned to one concrete version.
+pub const ENV_EXPECT_MODEL: &str = "AGENTGATEWAY_SAFEGUARDS_EXPECT_MODEL";
 pub const ENV_API_KEY: &str = "AGENTGATEWAY_SAFEGUARDS_API_KEY";
 pub const ENV_BASE_URL: &str = "AGENTGATEWAY_SAFEGUARDS_BASE_URL";
 pub const ENV_TIMEOUT_MS: &str = "AGENTGATEWAY_SAFEGUARDS_TIMEOUT_MS";
@@ -65,6 +73,13 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(30_000);
 pub const DEFAULT_MAX_CONCURRENCY: usize = 8;
 /// Hard cap on tool uses classified per turn; anything beyond is `unavailable`.
 pub const MAX_TOOL_USES_PER_TURN: usize = 32;
+/// Identity allowlist entry that admits every *authenticated* principal.
+pub const IDENTITY_WILDCARD: &str = "*";
+/// Re-verify the pinned model this often while it is verified.
+pub const VERIFY_INTERVAL: Duration = Duration::from_secs(600);
+/// First retry delay after a failed verification; doubles up to the maximum.
+pub const VERIFY_RETRY_MIN: Duration = Duration::from_secs(15);
+pub const VERIFY_RETRY_MAX: Duration = Duration::from_secs(300);
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -104,11 +119,16 @@ pub struct SafeguardsConfig {
 	pub mode: Mode,
 	pub provider: String,
 	pub model: String,
+	/// Exact model name every response must report (see `ENV_EXPECT_MODEL`).
+	/// `None` pins to `model` itself.
+	pub expect_model: Option<String>,
 	pub base_url: String,
 	pub timeout: Duration,
 	/// Client-facing model aliases served (exact, or `prefix*`). Empty = none.
 	pub routes: Vec<String>,
-	/// Principal identities (JWT `sub`) served. Empty = every identity.
+	/// Principal identities (JWT `sub`) served. Empty = NO identity (fail
+	/// closed); `*` admits every authenticated principal. An unauthenticated
+	/// request never matches.
 	pub identities: Vec<String>,
 	pub max_concurrency: usize,
 	pub long_context: bool,
@@ -121,6 +141,7 @@ impl Default for SafeguardsConfig {
 			mode: Mode::Disabled,
 			provider: PROVIDER_TYPESAFE.to_string(),
 			model: typesafe::DEFAULT_MODEL.to_string(),
+			expect_model: None,
 			base_url: typesafe::DEFAULT_BASE_URL.to_string(),
 			timeout: DEFAULT_TIMEOUT,
 			routes: Vec::new(),
@@ -138,6 +159,7 @@ impl std::fmt::Debug for SafeguardsConfig {
 			.field("mode", &self.mode)
 			.field("provider", &self.provider)
 			.field("model", &self.model)
+			.field("expect_model", &self.expected_model())
 			.field("base_url", &self.base_url)
 			.field("timeout", &self.timeout)
 			.field("routes", &self.routes)
@@ -182,6 +204,9 @@ impl SafeguardsConfig {
 		if let Some(raw) = var(ENV_MODEL) {
 			cfg.model = raw.trim().to_string();
 		}
+		if let Some(raw) = var(ENV_EXPECT_MODEL) {
+			cfg.expect_model = Some(raw.trim().to_string());
+		}
 		if let Some(raw) = var(ENV_BASE_URL) {
 			cfg.base_url = raw.trim().trim_end_matches('/').to_string();
 		}
@@ -221,6 +246,11 @@ impl SafeguardsConfig {
 				"{ENV_ROUTES} is empty: safeguards are active but no route is allowlisted"
 			));
 		}
+		if cfg.mode != Mode::Disabled && cfg.identities.is_empty() {
+			warnings.push(format!(
+				"{ENV_IDENTITIES} is empty: safeguards are active but no principal is allowlisted, nothing will be classified (use `*` to admit every authenticated principal)"
+			));
+		}
 		if cfg.mode != Mode::Disabled && cfg.api_key.is_none() {
 			warnings.push(format!(
 				"{ENV_API_KEY} is not set: allowlisted routes will answer `unsupported`"
@@ -233,6 +263,11 @@ impl SafeguardsConfig {
 		self.mode != Mode::Disabled
 	}
 
+	/// The exact model name every classifier response must report.
+	pub fn expected_model(&self) -> &str {
+		self.expect_model.as_deref().unwrap_or(&self.model)
+	}
+
 	pub fn route_allowed(&self, request_model: &str) -> bool {
 		self
 			.routes
@@ -240,11 +275,17 @@ impl SafeguardsConfig {
 			.any(|pattern| glob_match(pattern, request_model))
 	}
 
+	/// Fail closed: only an authenticated principal that is explicitly listed
+	/// (or any authenticated principal when the list contains `*`) matches. An
+	/// empty list or a missing identity never matches.
 	pub fn identity_allowed(&self, identity: Option<&str>) -> bool {
-		if self.identities.is_empty() {
-			return true;
-		}
-		identity.is_some_and(|id| self.identities.iter().any(|allowed| allowed == id))
+		let Some(id) = identity.map(str::trim).filter(|id| !id.is_empty()) else {
+			return false;
+		};
+		self
+			.identities
+			.iter()
+			.any(|allowed| allowed == IDENTITY_WILDCARD || allowed == id)
 	}
 
 	pub fn typesafe_config(&self) -> Option<TypeSafeConfig> {
@@ -320,10 +361,34 @@ impl Classifier for TypeSafeClient {
 	}
 }
 
+/// Whether the provider has confirmed it serves the pinned classifier model.
+/// Anything but `Verified` fails closed: the gateway answers `unsupported`
+/// (the client keeps its own classifier) and never calls the model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verification {
+	/// Not probed yet (process start).
+	Pending,
+	/// `GET /v1/models` listed the requested model name exactly.
+	Verified,
+	/// The probe failed or the model is not listed; retried in the background.
+	Failed { label: &'static str },
+}
+
+impl Verification {
+	pub fn label(&self) -> &'static str {
+		match self {
+			Verification::Pending => "pending",
+			Verification::Verified => "verified",
+			Verification::Failed { label } => label,
+		}
+	}
+}
+
 pub struct Runtime {
 	pub config: SafeguardsConfig,
 	classifier: Option<Arc<dyn Classifier>>,
 	limiter: Arc<Semaphore>,
+	verification: ArcSwap<Verification>,
 }
 
 impl Runtime {
@@ -333,18 +398,28 @@ impl Runtime {
 			config,
 			classifier,
 			limiter,
+			verification: ArcSwap::from_pointee(Verification::Pending),
 		}
 	}
 
 	pub fn classifier(&self) -> Option<Arc<dyn Classifier>> {
 		self.classifier.clone()
 	}
+
+	pub fn verification(&self) -> Verification {
+		(**self.verification.load()).clone()
+	}
+
+	pub fn set_verification(&self, state: Verification) {
+		self.verification.store(Arc::new(state));
+	}
 }
 
 static RUNTIME: Lazy<ArcSwap<Runtime>> =
 	Lazy::new(|| ArcSwap::from_pointee(Runtime::new(SafeguardsConfig::default(), None)));
 
-/// Install configuration and classifier (startup and tests).
+/// Install configuration and classifier (startup and tests). The model starts
+/// unverified; `spawn_model_verification` (or `verify_once`) confirms it.
 pub fn install(config: SafeguardsConfig, classifier: Option<Arc<dyn Classifier>>) {
 	RUNTIME.store(Arc::new(Runtime::new(config, classifier)));
 }
@@ -377,6 +452,7 @@ pub fn init_from_env() -> SafeguardsConfig {
 		safeguards.mode = config.mode.label(),
 		safeguards.provider = %config.provider,
 		safeguards.model = %config.model,
+		safeguards.expect_model = %config.expected_model(),
 		safeguards.routes = config.routes.len(),
 		safeguards.identities = config.identities.len(),
 		safeguards.timeout_ms = config.timeout.as_millis() as u64,
@@ -387,34 +463,65 @@ pub fn init_from_env() -> SafeguardsConfig {
 	config
 }
 
-/// Background probe: confirm the pinned model is served (`GET /v1/models`).
-/// Never substitutes an alias; a missing model is logged and the runtime keeps
-/// answering `unsupported` through the classifier's own error path.
+/// One verification probe (`GET /v1/models`): the requested model name must be
+/// listed exactly — an alias such as `jev-latest` is never accepted as a
+/// substitute for a pinned version. Records the outcome on the current runtime.
+pub async fn verify_once(classifier: &dyn Classifier) -> Verification {
+	let state = match classifier.verify().await {
+		Ok(verification) if verification.available => {
+			info!(
+				safeguards.model = %verification.requested,
+				"safeguards classifier model verified"
+			);
+			Verification::Verified
+		},
+		Ok(verification) => {
+			warn!(
+				safeguards.model = %verification.requested,
+				safeguards.listed_models = ?verification.listed,
+				"safeguards classifier model is NOT listed by the provider; failing closed (unsupported), no alias substitution"
+			);
+			Verification::Failed {
+				label: "model_not_listed",
+			}
+		},
+		Err(error) => {
+			warn!(
+				safeguards.error = error.label(),
+				"safeguards classifier model verification failed; failing closed (unsupported) until it succeeds"
+			);
+			Verification::Failed {
+				label: error.label(),
+			}
+		},
+	};
+	runtime().set_verification(state.clone());
+	state
+}
+
+/// Background probe loop: verify the pinned model at startup, re-verify every
+/// `VERIFY_INTERVAL` while verified and retry with backoff while failed, so a
+/// transient outage of the provider's model listing recovers on its own. Only
+/// the safeguards capability depends on this; LLM inference never does.
 pub fn spawn_model_verification() {
 	let Some(classifier) = runtime().classifier() else {
 		return;
 	};
 	tokio::spawn(async move {
-		match classifier.verify().await {
-			Ok(verification) if verification.available => {
-				info!(
-					safeguards.model = %verification.requested,
-					"safeguards classifier model verified"
-				);
-			},
-			Ok(verification) => {
-				warn!(
-					safeguards.model = %verification.requested,
-					safeguards.listed_models = ?verification.listed,
-					"safeguards classifier model is NOT listed by the provider; requests will fail closed (unsupported/unavailable), no alias substitution"
-				);
-			},
-			Err(error) => {
-				warn!(
-					safeguards.error = error.label(),
-					"safeguards classifier model verification failed"
-				);
-			},
+		let mut backoff = VERIFY_RETRY_MIN;
+		loop {
+			let delay = match verify_once(classifier.as_ref()).await {
+				Verification::Verified => {
+					backoff = VERIFY_RETRY_MIN;
+					VERIFY_INTERVAL
+				},
+				_ => {
+					let delay = backoff;
+					backoff = (backoff * 2).min(VERIFY_RETRY_MAX);
+					delay
+				},
+			};
+			tokio::time::sleep(delay).await;
 		}
 	});
 }
@@ -577,8 +684,19 @@ pub async fn evaluate(
 		record_results(ctx, &rt.config, "unsupported", 1);
 		return results_unsupported();
 	};
+	// Only a verified pinned model may authorize anything. Pending or failed
+	// verification answers `unsupported` without calling the provider.
+	let verification = rt.verification();
+	if verification != Verification::Verified {
+		summary.unsupported = true;
+		log_summary(plan, ctx, &summary, "model_unverified");
+		record_decision_label(ctx.metrics.as_deref(), "model_unverified");
+		record_results(ctx, &rt.config, "unsupported", 1);
+		return results_unsupported();
+	}
 	let provider = classifier.provider().to_string();
 	let model = classifier.model().to_string();
+	let expected_model = rt.config.expected_model().to_string();
 
 	if pending.len() > MAX_TOOL_USES_PER_TURN {
 		summary.unavailable = pending.len();
@@ -673,19 +791,31 @@ pub async fn evaluate(
 			let id = pending[index].id().to_string();
 			summary.classifier_calls += 1;
 			match result {
+				Ok(outcome) if outcome.response.model != expected_model => {
+					// The pin is the whole point: an alias that moved or a provider
+					// substitution never authorizes anything. Fail closed for the turn.
+					summary.classifier_errors += 1;
+					summary.unsupported = true;
+					record_call(
+						ctx,
+						&provider,
+						&model,
+						"model_mismatch",
+						Some(outcome.latency),
+					);
+					record_tokens(ctx, &provider, &model, &outcome.response.usage);
+					warn!(
+						safeguards.expected_model = %expected_model,
+						safeguards.resolved_model = %outcome.response.model,
+						"safeguards classifier answered with a different model than pinned; failing closed (unsupported)"
+					);
+				},
 				Ok(outcome) => {
 					record_call(ctx, &provider, &model, "ok", Some(outcome.latency));
 					record_tokens(ctx, &provider, &model, &outcome.response.usage);
 					summary.input_tokens += outcome.response.usage.input_tokens;
 					summary.output_tokens += outcome.response.usage.output_tokens;
 					summary.max_latency_ms = summary.max_latency_ms.max(outcome.latency.as_millis());
-					if outcome.response.model != model {
-						warn!(
-							safeguards.requested_model = %model,
-							safeguards.resolved_model = %outcome.response.model,
-							"safeguards classifier resolved a different model than requested"
-						);
-					}
 					verdicts.insert(id, policy::combine(&outcome.response.answers, floor));
 				},
 				Err(error) => {

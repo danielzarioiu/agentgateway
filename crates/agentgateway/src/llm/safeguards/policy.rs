@@ -1,4 +1,4 @@
-//! Safeguards classification rubric v1: deterministic policy rules combined
+//! Safeguards classification rubric v2: deterministic policy rules combined
 //! with TypeSafe System One decision questions.
 //!
 //! Decision pipeline for ONE tool call:
@@ -6,16 +6,20 @@
 //! 1. `pre_decide` — deterministic, no model. Mandatory denials (actions that
 //!    are never auto-approved: remote code execution, root/home destruction,
 //!    credential exfiltration, agent self-escalation) and a narrow read-only
-//!    fast path inside trusted directories. Everything else asks the classifier,
-//!    optionally with a "high-impact floor" (the action can only be Safe when the
-//!    user explicitly authorized it).
+//!    fast path inside eligible trusted directories. Everything else asks the
+//!    classifier, optionally with a "high-impact floor".
 //! 2. `build_state` + `questions` — the System One request: minimized context
 //!    plus a fixed, versioned set of typed questions (one dimension each).
-//! 3. `combine` — maps the probabilities to a verdict with hard rules that a
-//!    model answer can never override (prompt injection, secret exfiltration,
-//!    mandatory denials, the high-impact floor). Ambiguity is never silently
-//!    approved: it becomes `NeedsApproval`, which the protocol reports as
-//!    `flagged` with a grounded explanation so Claude Code asks the user.
+//! 3. `combine` — maps the probabilities to a verdict with hard rules:
+//!    - a prompt-injection or credential-exfiltration signal at HIGH is
+//!      `Dangerous` whatever the model says elsewhere;
+//!    - any risk dimension at HIGH: unauthorized -> `Dangerous`, authorized ->
+//!      at most `NeedsApproval` (model-inferred authorization never
+//!      auto-approves a high-risk action);
+//!    - the high-impact floor always requires manual approval;
+//!    - `overall` dangerous or uncertain never produces `Safe`;
+//!    - a dimension above MID (leaning risk) never produces `Safe`;
+//!    - a missing or malformed answer is `Unavailable`, never `Safe`.
 //!
 //! Model confidence is treated as evidence, not as a security guarantee.
 //! Repository files, tool outputs and retrieved content are untrusted data.
@@ -31,10 +35,13 @@ use serde_json::{Value, json};
 
 use super::typesafe::{Answer, Question};
 
-pub const RUBRIC_VERSION: &str = "synapse-safeguards-rubric/v1";
+pub const RUBRIC_VERSION: &str = "synapse-safeguards-rubric/v2";
 
 /// A `noul` probability at or above this is treated as "yes".
 pub const HIGH: f64 = 0.70;
+/// A dimension above this "leans yes": it is never auto-approved on the
+/// model's own reading of the transcript alone.
+pub const MID: f64 = 0.50;
 /// A `noul` probability at or below this is treated as "no".
 pub const LOW: f64 = 0.30;
 /// Rendered JSON budget for the tool input placed in `state`.
@@ -100,21 +107,24 @@ pub enum PreDecision {
 	},
 	/// Read-only tool inside the trusted directories: no classifier call.
 	FastPathSafe { rule: &'static str },
-	/// Ask the classifier. `floor` names a high-impact rule: the call can only
-	/// be `Safe` if the user explicitly authorized it.
+	/// Ask the classifier. `floor` names a high-impact rule: the call is never
+	/// auto-approved (at best `NeedsApproval`), whatever the answers say.
 	AskClassifier { floor: Option<&'static str> },
 }
 
-/// Read-only Claude Code tools eligible for the fast path (name match is exact).
-const READ_ONLY_TOOLS: &[&str] = &[
-	"Read",
-	"Glob",
-	"Grep",
-	"LS",
-	"NotebookRead",
-	"TodoRead",
-	"TodoWrite",
+/// Read-only Claude Code filesystem tools eligible for the fast path: exact
+/// name, the argument that must resolve inside a trusted directory, and
+/// whether that argument is required. `TodoRead`/`TodoWrite` (session state,
+/// not a filesystem read), MCP tools and anything unknown go to the classifier.
+const READ_ONLY_FS_TOOLS: &[(&str, &str, bool)] = &[
+	("Read", "file_path", true),
+	("NotebookRead", "notebook_path", true),
+	("LS", "path", true),
+	("Glob", "path", false),
+	("Grep", "path", false),
 ];
+/// Upper bound on a path argument accepted by the fast path.
+const FAST_PATH_MAX_PATH_CHARS: usize = 4_096;
 /// Tools whose `file_path`-like argument is the target of a write.
 const WRITE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
 const PATH_KEYS: &[&str] = &["file_path", "path", "notebook_path", "directory", "cwd"];
@@ -141,6 +151,15 @@ static REMOTE_CODE_EXECUTION: Lazy<Vec<Regex>> = Lazy::new(|| {
 		regex(
 			r"(?i)\b(iex|Invoke-Expression)\b[^\n]*(Invoke-WebRequest|\biwr\b|DownloadString|\birm\b)",
 		),
+		// Decoded or constructed text executed by a shell/interpreter reading
+		// stdin: base64/xxd/openssl output, or echo/printf, piped into a bare
+		// `sh` (no script argument) or an interpreter.
+		regex(
+			r"(?i)\b(base64\s+(-d|-D|--decode)|xxd\s+-r|openssl\s+(enc\s+-d|base64\s+-d))\b[^\n]*\|\s*(sudo\s+)?((ba|z|da|k)?sh|python[0-9.]*|perl|node|ruby)\b",
+		),
+		regex(r"(?i)\b(echo|printf)\b[^|\n]*\|\s*(sudo\s+)?((ba|z|da|k)?sh)(\s+-[a-z]+)*\s*($|[;&|)])"),
+		// Interpreter one-liners that decode and exec
+		regex(r"(?i)\b(exec|eval)\s*\(\s*(base64|b64decode|codecs\.decode|bytes\.fromhex)"),
 	]
 });
 
@@ -156,10 +175,14 @@ static SYSTEM_DESTRUCTION: Lazy<Vec<Regex>> = Lazy::new(|| {
 		regex(r"(?i)\bchown\s+-[a-z]*R[a-z]*\s+\S+\s+/(\s|$)"),
 		regex(r"(?i)\bdiskutil\s+(erase|partition|zero|secureErase)"),
 		regex(r"(?i)(^|[;&|]\s*)format\s+[a-z]:"),
+		// find over the root or home that deletes what it finds
+		regex(r"(?i)\bfind\s+(/|~|\$HOME|\$\{HOME\})(\s|/\s)[^\n]*(-delete\b|-exec\s+(sudo\s+)?rm\b)"),
 	]
 });
 
-/// Targets for which a recursive `rm` is never auto-approved.
+/// Targets for which a recursive `rm` is never auto-approved: the root, the
+/// home directory, system directories, the parent directory, bare wildcards
+/// and the user's credential directories.
 const PROTECTED_RM_TARGETS: &[&str] = &[
 	"/",
 	"/*",
@@ -196,11 +219,29 @@ const PROTECTED_RM_TARGETS: &[&str] = &[
 	"c:\\",
 	"c:/",
 	"*",
+	"~/.ssh",
+	"~/.aws",
+	"~/.gnupg",
+	"~/.kube",
+	"~/.docker",
+	"~/.config",
+	"$home/.ssh",
+	"$home/.aws",
+	"$home/.gnupg",
+	"$home/.kube",
+	"$home/.docker",
+	"$home/.config",
+	"${home}/.ssh",
+	"${home}/.aws",
+	"${home}/.gnupg",
+	"${home}/.kube",
+	"${home}/.docker",
+	"${home}/.config",
 ];
 
 static SECRET_LOCATION: Lazy<Regex> = Lazy::new(|| {
 	regex(
-		r"(?i)(\.aws/(credentials|config)|\.ssh/(id_[a-z0-9_]+|authorized_keys|known_hosts)|\.kube/config|\.docker/config\.json|\.netrc|\.npmrc|\.pypirc|\.gnupg|\.git-credentials|(^|[\s/'\x22@=])\.env(\.[a-z0-9_-]+)?\b|/etc/(shadow|sudoers)|\.(pem|p12|pfx|key)\b|credentials\.json|service[-_]?account[^\s]*\.json|secrets?\.(ya?ml|json))",
+		r"(?i)(\.aws(/|\b)|\.ssh(/|\b)|\.kube(/|\b)|\.docker/config\.json|\.netrc|\.npmrc|\.pypirc|\.gnupg|\.git-credentials|(^|[\s/'\x22@=])\.env(\.[a-z0-9_-]+)?\b|/etc/(shadow|sudoers)|\.(pem|p12|pfx|key)\b|credentials\.json|service[-_]?account[^\s]*\.json|secrets?\.(ya?ml|json))",
 	)
 });
 static SECRET_ENV_REFERENCE: Lazy<Regex> = Lazy::new(|| {
@@ -271,7 +312,7 @@ static HIGH_IMPACT_FLOOR: Lazy<Vec<(&'static str, Regex)>> = Lazy::new(|| {
 		(
 			"git-history",
 			regex(
-				r"(?i)\bgit\s+push\b[^\n]*(--force\b|\s-f\b|--force-with-lease|\s\+[^\s:]*:)|\bgit\s+(reset\s+--hard|clean\s+-[a-z]*f|checkout\s+--\s|restore\s+(\.|--staged)|branch\s+-D|rebase|filter-(branch|repo)|reflog\s+expire|gc\s+--prune|tag\s+-d|push\s+[^\n]*--delete)\b",
+				r"(?i)\bgit\s+push\b[^\n]*(--force\b|\s-f\b|--force-with-lease|\s\+[^\s:]*:)|\bgit\s+(reset\s+--hard|clean\s+-[a-z]*f[a-z]*|checkout\s+--\s|restore\s+(\.|--staged)|branch\s+-D|rebase|filter-(branch|repo)|reflog\s+expire|gc\s+--prune|tag\s+-d|push\s+[^\n]*--delete)\b",
 			),
 		),
 		(
@@ -306,6 +347,14 @@ static HIGH_IMPACT_FLOOR: Lazy<Vec<(&'static str, Regex)>> = Lazy::new(|| {
 			"package-removal",
 			regex(r"(?i)\b(apt(-get)?|yum|dnf|brew|pacman)\s+(remove|purge|uninstall|autoremove)\b"),
 		),
+		(
+			// Download to a file, then run it in a later statement (the piped form
+			// is a mandatory denial; this split form at least needs a human).
+			"download-then-execute",
+			regex(
+				r"(?i)\b(curl|wget)\b[^\n;&|]*\s(-o|-O|--output(-document)?)\b[^\n]*(;|&&|\|\|)\s*(sudo\s+)?((ba|z|da|k)?sh|python[0-9.]*|perl|node|ruby|chmod\s+\+x)\b",
+			),
+		),
 	]
 });
 
@@ -339,19 +388,18 @@ pub fn pre_decide(review: &ToolCallReview<'_>) -> PreDecision {
 		if let Some(denial) = shell_mandatory_denial(&command) {
 			return denial;
 		}
-		let floor = HIGH_IMPACT_FLOOR
-			.iter()
-			.find(|(_, re)| re.is_match(&command))
-			.map(|(rule, _)| *rule);
+		let floor = high_impact_floor(&command).or_else(|| {
+			recursive_rm_outside_trusted(&command, &trusted, cwd, home)
+				.then_some("recursive-delete-outside-trusted")
+		});
 		return PreDecision::AskClassifier { floor };
 	}
 
-	if READ_ONLY_TOOLS.contains(&review.name) {
-		let paths = path_arguments(review.input);
-		let inside = paths
-			.iter()
-			.all(|path| is_within_trusted(path, &trusted, cwd, home));
-		if inside && !trusted.is_empty() {
+	if READ_ONLY_FS_TOOLS
+		.iter()
+		.any(|(name, _, _)| *name == review.name)
+	{
+		if read_only_fast_path(review, &trusted, cwd, home) {
 			return PreDecision::FastPathSafe {
 				rule: "read-only-inside-trusted",
 			};
@@ -368,7 +416,117 @@ pub fn pre_decide(review: &ToolCallReview<'_>) -> PreDecision {
 		};
 	}
 
-	PreDecision::AskClassifier { floor: None }
+	// Unknown or MCP tools: the gateway does not know their semantics, so the
+	// string arguments (which the tool may execute) get the shell rules and a
+	// path-like argument outside the trusted directories is a floor.
+	let strings = string_arguments(review.input);
+	for text in &strings {
+		if let Some(denial) = shell_mandatory_denial(text) {
+			return denial;
+		}
+	}
+	let floor = strings
+		.iter()
+		.find_map(|text| high_impact_floor(text))
+		.or_else(|| {
+			path_arguments(review.input)
+				.iter()
+				.any(|path| !is_within_trusted(path, &trusted, cwd, home))
+				.then_some("path-outside-trusted")
+		});
+	PreDecision::AskClassifier { floor }
+}
+
+fn high_impact_floor(command: &str) -> Option<&'static str> {
+	HIGH_IMPACT_FLOOR
+		.iter()
+		.find(|(_, re)| re.is_match(command))
+		.map(|(rule, _)| *rule)
+}
+
+/// The read-only fast path approves without a classifier call, so it is
+/// deliberately narrow: an exact read-only tool name, every path-like argument
+/// a well-formed POSIX path that resolves (lexically) inside an eligible
+/// trusted directory, the tool's own path argument present when required (or
+/// the working directory itself an eligible root when it is optional), and no
+/// secret-looking target. The trusted set follows Claude Code's model (the
+/// explicit trusted directories plus the working directory) minus roots too
+/// broad to auto-approve (`/`, the home directory and its ancestors). The
+/// gateway cannot see the client's filesystem, so containment is lexical:
+/// symlinks escaping a trusted directory are a known limit of this path (reads
+/// only; writes never fast-path).
+fn read_only_fast_path(
+	review: &ToolCallReview<'_>,
+	trusted: &[String],
+	cwd: Option<&str>,
+	home: Option<&str>,
+) -> bool {
+	let Some((_, path_key, required)) = READ_ONLY_FS_TOOLS
+		.iter()
+		.find(|(name, _, _)| *name == review.name)
+	else {
+		return false;
+	};
+	let roots: Vec<String> = trusted
+		.iter()
+		.filter(|dir| eligible_trusted_root(dir, cwd, home))
+		.cloned()
+		.collect();
+	if roots.is_empty() {
+		return false;
+	}
+	let Some(object) = review.input.as_object() else {
+		return false;
+	};
+	match object.get(*path_key) {
+		Some(Value::String(path)) => {
+			if !fast_path_argument_ok(path) {
+				return false;
+			}
+		},
+		None if !*required => {
+			// Defaults to the working directory: it must itself be trusted.
+			match cwd {
+				Some(cwd) if is_within_trusted(cwd, &roots, Some(cwd), home) => {},
+				_ => return false,
+			}
+		},
+		_ => return false,
+	}
+	let paths = path_arguments(review.input);
+	paths
+		.iter()
+		.all(|path| fast_path_argument_ok(path) && is_within_trusted(path, &roots, cwd, home))
+}
+
+/// A trusted directory broad enough to cover the whole machine or the user's
+/// home does not qualify for the fast path (the classifier still sees it).
+fn eligible_trusted_root(dir: &str, cwd: Option<&str>, home: Option<&str>) -> bool {
+	let Some(dir) = normalize_path(dir, cwd, home) else {
+		return false;
+	};
+	if dir == "/" {
+		return false;
+	}
+	match home.and_then(|h| normalize_path(h, cwd, Some(h))) {
+		Some(home) => dir != home && !home.starts_with(&format!("{dir}/")),
+		None => true,
+	}
+}
+
+/// A path argument the fast path is willing to reason about: a plain POSIX
+/// path. Backslashes and drive letters are Windows shapes that `normalize_path`
+/// would otherwise read as a relative file name inside the working directory.
+fn fast_path_argument_ok(path: &str) -> bool {
+	let bytes = path.as_bytes();
+	let drive_letter = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+	!path.trim().is_empty()
+		&& path == path.trim()
+		&& path.len() <= FAST_PATH_MAX_PATH_CHARS
+		&& !path.chars().any(char::is_control)
+		&& !path.contains('\\')
+		&& !drive_letter
+		&& !SECRET_LOCATION.is_match(path)
 }
 
 fn shell_mandatory_denial(command: &str) -> Option<PreDecision> {
@@ -408,13 +566,64 @@ fn shell_mandatory_denial(command: &str) -> Option<PreDecision> {
 }
 
 /// `rm` with a recursive flag whose target is the root, the home directory, a
-/// system directory, the parent directory or a bare wildcard.
+/// system directory, a credential directory, the parent directory or a bare
+/// wildcard.
 fn recursive_rm_on_protected_target(command: &str) -> bool {
-	for segment in command.split([';', '|', '&', '\n']) {
+	recursive_rm_targets(command).iter().any(|t| {
+		let lower = t.to_ascii_lowercase();
+		let normalized = lower.trim_end_matches('/');
+		let normalized = if normalized.is_empty() {
+			"/"
+		} else {
+			normalized
+		};
+		PROTECTED_RM_TARGETS.contains(&normalized)
+			|| PROTECTED_RM_TARGETS.contains(&lower.as_str())
+			|| lower.starts_with("../")
+			|| lower.starts_with("~/../")
+	})
+}
+
+/// `rm` with a recursive flag whose target resolves outside every trusted
+/// directory (a floor: the classifier decides, but never auto-approves).
+fn recursive_rm_outside_trusted(
+	command: &str,
+	trusted: &[String],
+	cwd: Option<&str>,
+	home: Option<&str>,
+) -> bool {
+	recursive_rm_targets(command).iter().any(|target| {
+		let lower = target.to_ascii_lowercase();
+		let path = if let Some(rest) = lower.strip_prefix("${home}") {
+			format!("~{rest}")
+		} else if let Some(rest) = lower.strip_prefix("$home") {
+			format!("~{rest}")
+		} else {
+			target.clone()
+		};
+		// `dir/*` means the children of `dir`; any other wildcard or shell
+		// variable cannot be resolved and is therefore not provably inside.
+		let path = path.strip_suffix("/*").unwrap_or(&path).to_string();
+		if path.contains('$') || path.contains('*') {
+			return true;
+		}
+		!is_within_trusted(&path, trusted, cwd, home)
+	})
+}
+
+/// Targets of every recursive `rm` invocation in `command`, with shell quoting
+/// and a leading backslash (alias bypass) stripped from the command word and
+/// the targets. `--` and options are skipped.
+fn recursive_rm_targets(command: &str) -> Vec<String> {
+	let mut out = Vec::new();
+	for segment in command.split([';', '|', '&', '\n', '(']) {
 		let mut tokens = segment.split_whitespace().peekable();
 		while let Some(token) = tokens.next() {
-			let bare = token.trim_start_matches("sudo").trim();
-			if bare != "rm" && token != "rm" {
+			let word = token
+				.trim_matches(['"', '\''])
+				.trim_start_matches('\\')
+				.replace(['"', '\''], "");
+			if word != "rm" {
 				continue;
 			}
 			let mut recursive = false;
@@ -435,29 +644,43 @@ fn recursive_rm_on_protected_target(command: &str) -> bool {
 					}
 					continue;
 				}
-				targets.push(arg.trim_matches(['"', '\'']).to_string());
+				targets.push(arg.trim_matches(['"', '\'', ')']).to_string());
 			}
-			if !recursive {
-				continue;
-			}
-			if targets.iter().any(|t| {
-				let lower = t.to_ascii_lowercase();
-				let normalized = lower.trim_end_matches('/');
-				let normalized = if normalized.is_empty() {
-					"/"
-				} else {
-					normalized
-				};
-				PROTECTED_RM_TARGETS.contains(&normalized)
-					|| PROTECTED_RM_TARGETS.contains(&lower.as_str())
-					|| lower.starts_with("../")
-					|| lower.starts_with("~/../")
-			}) {
-				return true;
+			if recursive {
+				out.extend(targets);
 			}
 		}
 	}
-	false
+	out
+}
+
+/// Every string value in a tool input (depth-limited), for tools whose
+/// semantics the gateway does not know.
+fn string_arguments(input: &Value) -> Vec<String> {
+	const MAX_DEPTH: usize = 4;
+	const MAX_STRINGS: usize = 64;
+	fn walk(value: &Value, depth: usize, out: &mut Vec<String>) {
+		if out.len() >= MAX_STRINGS {
+			return;
+		}
+		match value {
+			Value::String(s) if !s.trim().is_empty() => out.push(s.clone()),
+			Value::Array(items) if depth < MAX_DEPTH => {
+				for item in items {
+					walk(item, depth + 1, out);
+				}
+			},
+			Value::Object(map) if depth < MAX_DEPTH => {
+				for item in map.values() {
+					walk(item, depth + 1, out);
+				}
+			},
+			_ => {},
+		}
+	}
+	let mut out = Vec::new();
+	walk(input, 0, &mut out);
+	out
 }
 
 fn credential_exfiltration(command: &str) -> bool {
@@ -792,11 +1015,19 @@ pub fn combine(answers: &BTreeMap<String, Answer>, floor: Option<&'static str>) 
 		.filter(|(_, _, p)| *p >= HIGH)
 		.map(|(_, label, _)| *label)
 		.collect();
-	let grey: Vec<&str> = risks
+	let leaning: Vec<&str> = risks
 		.iter()
-		.filter(|(_, _, p)| *p > LOW && *p < HIGH)
+		.filter(|(_, _, p)| *p > MID && *p < HIGH)
 		.map(|(_, label, _)| *label)
 		.collect();
+	let grey: Vec<&str> = risks
+		.iter()
+		.filter(|(_, _, p)| *p > LOW && *p <= MID)
+		.map(|(_, label, _)| *label)
+		.collect();
+	// The classifier's reading of the transcript. It is model-inferred
+	// evidence: it can turn a denial into a request for confirmation, never
+	// into an automatic approval of a high-risk or high-impact action.
 	let explicitly_authorized = authorized >= HIGH;
 
 	if !high.is_empty() {
@@ -808,49 +1039,54 @@ pub fn combine(answers: &BTreeMap<String, Answer>, floor: Option<&'static str>) 
 				),
 			};
 		}
-		// Explicitly authorized high-impact work is allowed by the rubric,
-		// unless the classifier's overall judgement still calls it dangerous.
-		if overall == "dangerous" {
-			return Verdict::NeedsApproval {
-				explanation: format!(
-					"[Manual approval required] [{}] The user appears to have requested this, but the classifier still rates it dangerous; confirm before running.",
-					high.join("][")
-				),
-			};
-		}
-		return Verdict::Safe;
-	}
-
-	if let Some(rule) = floor
-		&& !explicitly_authorized
-	{
 		return Verdict::NeedsApproval {
 			explanation: format!(
-				"[Manual approval required] [High-impact: {rule}] This class of action needs an explicit request from the user."
+				"[Manual approval required] [{}] The user appears to have requested this high-risk action; server-side policy still requires your confirmation (classifier: {overall}).",
+				high.join("][")
 			),
 		};
 	}
 
-	if grey.is_empty() && injection <= LOW && overall == "safe" {
-		return Verdict::Safe;
-	}
-	// Grey-zone risk, but the user explicitly asked for this exact action and
-	// the classifier's overall judgement agrees it is safe.
-	if explicitly_authorized && injection <= LOW && overall == "safe" {
-		return Verdict::Safe;
+	if let Some(rule) = floor {
+		return Verdict::NeedsApproval {
+			explanation: format!(
+				"[Manual approval required] [High-impact: {rule}] This class of action is never auto-approved; confirm before running (classifier: {overall})."
+			),
+		};
 	}
 
-	let mut reasons: Vec<String> = grey.iter().map(|g| format!("[{g}]")).collect();
-	if injection > LOW {
-		reasons.push("[Instruction origin unclear]".to_string());
-	}
 	if overall != "safe" {
-		reasons.push(format!("[Classifier: {overall}]"));
+		return Verdict::NeedsApproval {
+			explanation: format!(
+				"[Manual approval required] [Classifier: {overall}] The classifier could not confirm this action is safe; confirm before running."
+			),
+		};
+	}
+	if injection > LOW {
+		return Verdict::NeedsApproval {
+			explanation: "[Manual approval required] [Instruction origin unclear] It is not clear the action follows the user's own request; confirm before running.".to_string(),
+		};
+	}
+	if !leaning.is_empty() {
+		return Verdict::NeedsApproval {
+			explanation: format!(
+				"[Manual approval required] [{}] The classifier leans towards risk on this dimension; confirm before running.",
+				leaning.join("][")
+			),
+		};
+	}
+	if grey.is_empty() {
+		return Verdict::Safe;
+	}
+	// Mild residual uncertainty (every dimension at most 0.5), the classifier's
+	// overall judgement is safe and the user asked for this exact action.
+	if explicitly_authorized {
+		return Verdict::Safe;
 	}
 	Verdict::NeedsApproval {
 		explanation: format!(
-			"[Manual approval required] {} The risk could not be ruled out with confidence; confirm before running.",
-			reasons.join("")
+			"[Manual approval required] [{}] The risk could not be ruled out with confidence and the user did not explicitly request this action; confirm before running.",
+			grey.join("][")
 		),
 	}
 }

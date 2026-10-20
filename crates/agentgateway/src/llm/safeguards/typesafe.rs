@@ -198,6 +198,19 @@ pub struct ModelVerification {
 	pub listed: Vec<String>,
 }
 
+impl ModelVerification {
+	/// Pure matching rule over a model listing: the requested name must appear
+	/// verbatim (case-sensitive, no alias or prefix resolution).
+	pub fn from_listing(requested: &str, models: Vec<ModelMetadata>) -> Self {
+		let listed: Vec<String> = models.into_iter().map(|m| m.name).collect();
+		Self {
+			requested: requested.to_string(),
+			available: listed.iter().any(|name| name == requested),
+			listed,
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -214,6 +227,10 @@ pub enum TypeSafeError {
 	Unauthorized(u16),
 	#[error("typesafe does not serve the configured model (HTTP {status}): {detail}")]
 	ModelUnavailable { status: u16, detail: String },
+	/// The response was produced by a model other than the pinned one (an alias
+	/// moved, or the provider substituted a version). Never accepted.
+	#[error("typesafe answered with model {resolved:?}, expected {expected:?}")]
+	ModelMismatch { expected: String, resolved: String },
 	#[error("typesafe rate limited the request (HTTP 429, retry-after {retry_after:?})")]
 	RateLimited { retry_after: Option<Duration> },
 	#[error("typesafe rejected the payload as too large (HTTP {0})")]
@@ -243,9 +260,10 @@ pub enum ProtocolFailure {
 impl TypeSafeError {
 	pub fn protocol_failure(&self) -> ProtocolFailure {
 		match self {
-			Self::Unauthorized(_) | Self::ModelUnavailable { .. } | Self::NotConfigured(_) => {
-				ProtocolFailure::Unsupported
-			},
+			Self::Unauthorized(_)
+			| Self::ModelUnavailable { .. }
+			| Self::ModelMismatch { .. }
+			| Self::NotConfigured(_) => ProtocolFailure::Unsupported,
 			Self::Timeout(_) => ProtocolFailure::Unavailable(UnavailableReason::Timeout),
 			Self::PayloadTooLarge(_) => ProtocolFailure::Unavailable(UnavailableReason::InputTooLong),
 			Self::RateLimited { .. }
@@ -262,6 +280,7 @@ impl TypeSafeError {
 			Self::Timeout(_) => "timeout",
 			Self::Unauthorized(_) => "unauthorized",
 			Self::ModelUnavailable { .. } => "model_unavailable",
+			Self::ModelMismatch { .. } => "model_mismatch",
 			Self::RateLimited { .. } => "rate_limited",
 			Self::PayloadTooLarge(_) => "payload_too_large",
 			Self::Rejected { .. } => "rejected",
@@ -490,12 +509,7 @@ impl TypeSafeClient {
 	/// substitute an alias such as `jev-latest`.
 	pub async fn verify_model(&self) -> Result<ModelVerification, TypeSafeError> {
 		let models = self.list_models().await?;
-		let listed: Vec<String> = models.into_iter().map(|m| m.name).collect();
-		Ok(ModelVerification {
-			requested: self.config.model.clone(),
-			available: listed.iter().any(|name| name == &self.config.model),
-			listed,
-		})
+		Ok(ModelVerification::from_listing(&self.config.model, models))
 	}
 
 	fn transport_error(&self, error: reqwest::Error) -> TypeSafeError {
