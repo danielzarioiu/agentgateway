@@ -416,4 +416,171 @@ mod tests {
 
 		clear_policy();
 	}
+
+	/// P3 demonstration (2026-10-20): the full no-restart policy lifecycle
+	/// against REAL control-plane builder output — revisions generated from
+	/// the prod catalog dump by
+	/// apps/control-plane/scratch/toolsearch-p3-demo-generate.mts through the
+	/// same buildToolSearchPolicyArtifact the publish action runs. Gated on
+	/// TOOLSEARCH_DEMO_DIR so normal CI skips it; the release runbook drives
+	/// it. Covers the operator's 10-step acceptance list: initial artifact,
+	/// auto->explicit-eager refresh, per-model-only change, invalid artifact
+	/// (last-known-good), unavailable endpoint, rollback restore, and native
+	/// models unaffected throughout.
+	#[tokio::test]
+	async fn policy_refresh_demo_with_real_control_plane_artifacts() {
+		use std::net::SocketAddr;
+		use std::sync::atomic::{AtomicBool, Ordering};
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+		let Ok(dir) = std::env::var("TOOLSEARCH_DEMO_DIR") else {
+			return;
+		};
+		let _guard = crate::config::lock_env_for_tests_async().await;
+		let previous_allowlist = std::env::var_os("AGENTGATEWAY_TOOL_SEARCH_MODELS");
+		unsafe {
+			// Mirrors the prod deployment allowlist (the safety ceiling).
+			std::env::set_var(
+				"AGENTGATEWAY_TOOL_SEARCH_MODELS",
+				"claude-fable-5,claude-opus-5-5,claude-sonnet-5-5",
+			);
+		}
+		clear_policy();
+
+		let read = |name: &str| std::fs::read(format!("{dir}/{name}")).expect("demo artifact readable");
+		let rev_a = read("rev-a.json");
+		let rev_b = read("rev-b.json");
+		let rev_c = read("rev-c.json");
+		let invalid = read("invalid.json");
+		let rollback = read("rev-d-rollback.json");
+
+		// Swappable artifact endpoint: `body` is what the control plane is
+		// currently serving; `serve_ok=false` simulates the endpoint being
+		// down entirely (connection up, HTTP 500).
+		let body: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(rev_a.clone()));
+		let serve_ok = Arc::new(AtomicBool::new(true));
+		let listener = tokio::net::TcpListener::bind(SocketAddr::from((
+			[127, 0, 0, 1],
+			0,
+		)))
+		.await
+		.unwrap();
+		let addr = listener.local_addr().unwrap();
+		{
+			let body = body.clone();
+			let serve_ok = serve_ok.clone();
+			tokio::spawn(async move {
+				loop {
+					let Ok((mut socket, _)) = listener.accept().await else {
+						break;
+					};
+					let body = body.clone();
+					let serve_ok = serve_ok.clone();
+					tokio::spawn(async move {
+						let mut buf = [0u8; 4096];
+						let _ = socket.read(&mut buf).await;
+						let response = if serve_ok.load(Ordering::SeqCst) {
+							let payload = body.lock().unwrap().clone();
+							format!(
+								"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+								payload.len()
+							)
+							.into_bytes()
+							.into_iter()
+							.chain(payload)
+							.collect::<Vec<u8>>()
+						} else {
+							"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+								.as_bytes()
+								.to_vec()
+						};
+						let _ = socket.write_all(&response).await;
+						let _ = socket.shutdown().await;
+					});
+				}
+			});
+		}
+		let url = format!("http://{addr}/api/internal/llm-gateway/toolsearch-policy");
+
+		// Steps 1-2: start with the current validated artifact. The CP
+		// builder resolved g53's `auto` to its effective mode `eager` (no
+		// runtime-verified native capability on its route), so the gateway
+		// serves eager compatibility under the artifact's explicit entry. A
+		// model NOT yet listed in the artifact (e.g. a newly enabled route
+		// before the next publish) falls back to default auto -> env ceiling.
+		refresh_policy_once(&url).await.expect("rev-a installs");
+		assert_eq!(current_policy().unwrap().revision, "tsrev-demo-a-2026-10-20");
+		let g53 = tool_search_decision(false, "claude-gateway-fireworks-route-g53");
+		assert!(!g53.allow_native);
+		assert_eq!(g53.reason, "policy-eager");
+		assert_eq!(g53.policy_revision.as_deref(), Some("tsrev-demo-a-2026-10-20"));
+		let unlisted = tool_search_decision(false, "claude-gateway-fireworks-route-g52");
+		assert!(!unlisted.allow_native);
+		assert_eq!(unlisted.reason, "policy-auto-env");
+
+		// Step 10 (checked at every stage): verified native models keep native.
+		let sonnet = tool_search_decision(true, "claude-sonnet-5-5");
+		assert!(sonnet.allow_native);
+		assert_eq!(sonnet.reason, "policy-native-env-confirmed");
+
+		// Steps 3-5: publish g53 explicitly eager; the refresh swaps the
+		// snapshot in place — no restart — and the decision reports the new
+		// revision with the explicit-eager reason.
+		*body.lock().unwrap() = rev_b.clone();
+		refresh_policy_once(&url).await.expect("rev-b installs");
+		let g53 = tool_search_decision(false, "claude-gateway-fireworks-route-g53");
+		assert!(!g53.allow_native);
+		assert_eq!(g53.reason, "policy-eager");
+		assert_eq!(g53.policy_revision.as_deref(), Some("tsrev-demo-b-2026-10-20"));
+
+		// Step 6: change ONLY the Flash route (g53f -> off); g53 is untouched.
+		*body.lock().unwrap() = rev_c.clone();
+		refresh_policy_once(&url).await.expect("rev-c installs");
+		let flash = tool_search_decision(false, "claude-gateway-fireworks-route-g53f");
+		assert!(!flash.allow_native);
+		assert_eq!(flash.reason, "policy-off");
+		let g53 = tool_search_decision(false, "claude-gateway-fireworks-route-g53");
+		assert_eq!(g53.reason, "policy-eager", "g53 must be unchanged by the flash edit");
+		assert!(tool_search_decision(true, "claude-sonnet-5-5").allow_native);
+
+		// Step 7: an invalid artifact NEVER installs; last-known-good keeps
+		// serving rev-c semantics.
+		*body.lock().unwrap() = invalid.clone();
+		assert!(refresh_policy_once(&url).await.is_err());
+		assert_eq!(current_policy().unwrap().revision, "tsrev-demo-c-2026-10-20");
+		assert_eq!(
+			tool_search_decision(false, "claude-gateway-fireworks-route-g53f").reason,
+			"policy-off"
+		);
+
+		// Step 8: endpoint unavailable entirely — same last-known-good.
+		serve_ok.store(false, Ordering::SeqCst);
+		assert!(refresh_policy_once(&url).await.is_err());
+		assert_eq!(current_policy().unwrap().revision, "tsrev-demo-c-2026-10-20");
+		serve_ok.store(true, Ordering::SeqCst);
+
+		// Step 9: rollback re-publishes the exact prior approved bytes; the
+		// gateway applies them on the next refresh — still no restart.
+		*body.lock().unwrap() = rollback;
+		refresh_policy_once(&url).await.expect("rollback installs");
+		assert_eq!(current_policy().unwrap().revision, "tsrev-demo-b-2026-10-20");
+		assert_eq!(
+			tool_search_decision(false, "claude-gateway-fireworks-route-g53").reason,
+			"policy-eager"
+		);
+		// Step 10, final: native models unaffected end-to-end.
+		let sonnet = tool_search_decision(true, "claude-sonnet-5-5");
+		assert!(sonnet.allow_native);
+		assert_eq!(sonnet.policy_revision.as_deref(), Some("tsrev-demo-b-2026-10-20"));
+
+		clear_policy();
+		match previous_allowlist {
+			Some(value) => unsafe {
+				std::env::set_var("AGENTGATEWAY_TOOL_SEARCH_MODELS", value);
+			},
+			None => unsafe {
+				std::env::remove_var("AGENTGATEWAY_TOOL_SEARCH_MODELS");
+			},
+		}
+	}
 }
