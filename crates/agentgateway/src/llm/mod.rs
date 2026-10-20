@@ -40,6 +40,7 @@ pub const DEFAULT_BUFFER_LIMIT: usize = 32 * 1024 * 1024;
 pub mod catalog;
 pub mod discovery;
 pub mod policy;
+pub mod safeguards;
 pub mod tool_search_policy;
 
 use policy::streaming_guardrails::GuardedSseBody;
@@ -1747,6 +1748,7 @@ impl AIProvider {
 				policies,
 				InputFormat::Completions,
 				false,
+				None,
 				req,
 				parts,
 				managed_body,
@@ -1834,12 +1836,60 @@ impl AIProvider {
 			native_tool_search = req.uses_native_tool_search();
 		}
 
+		// Claude Code Auto Mode safeguards (server-side classifier review),
+		// decided per attempt like the Tool Search guard above. The Anthropic
+		// Platform leg implements the protocol itself and is left untouched;
+		// an allowlisted non-native leg has the `safeguards` field and the
+		// `dangerous-tool-use` beta removed before upstream and carries a
+		// bounded review plan to the response side, which classifies the
+		// completed tool uses. Disabled mode is byte-identical to a gateway
+		// without this feature. Telemetry is counts and static labels only.
+		let safeguards_plan = {
+			let request_model = req.model.clone().unwrap_or_default();
+			let requested = types::safeguards::requested_dangerous_tool_use(&req.rest);
+			let runtime = safeguards::runtime();
+			let identity = safeguards::identity_from_claims(parts.extensions.get::<Claims>());
+			let decision = safeguards::decide(
+				&runtime.config,
+				requested.is_some(),
+				matches!(self, AIProvider::Anthropic(_)),
+				&request_model,
+				identity.as_deref(),
+			);
+			safeguards::record_decision(Some(backend_info.inputs.metrics.as_ref()), decision);
+			match (decision, requested) {
+				(safeguards::Decision::Classify { shadow }, Some(requested)) => {
+					let messages = serde_json::to_value(&req.messages).unwrap_or(serde_json::Value::Null);
+					let mut plan = types::safeguards::SafeguardsReviewPlan::from_request(
+						&request_model,
+						&messages,
+						&requested,
+					);
+					plan.identity = identity;
+					let removed_field = types::safeguards::remove_safeguards(&mut req.rest);
+					let removed_beta = types::safeguards::strip_dangerous_tool_use_beta(&mut parts.headers);
+					info!(
+						safeguards.decision = decision.label(),
+						safeguards.shadow = shadow,
+						safeguards.removed_field = removed_field,
+						safeguards.removed_beta = removed_beta,
+						safeguards.transcript_lines = plan.transcript.len(),
+						safeguards.transcript_truncated = plan.transcript_truncated,
+						"claude code safeguards handled locally for a non-native leg"
+					);
+					Some(Arc::new(plan))
+				},
+				_ => None,
+			}
+		};
+
 		self
 			.process_chat_request(
 				backend_info,
 				policies,
 				InputFormat::Messages,
 				native_tool_search,
+				safeguards_plan,
 				req,
 				parts,
 				managed_body,
@@ -1883,6 +1933,7 @@ impl AIProvider {
 				policies,
 				InputFormat::Gemini,
 				false,
+				None,
 				req,
 				parts,
 				managed_body,
@@ -1976,6 +2027,7 @@ impl AIProvider {
 				policies,
 				InputFormat::Responses,
 				false,
+				None,
 				req,
 				parts,
 				managed_body,
@@ -2327,6 +2379,7 @@ impl AIProvider {
 		policies: Option<&Policy>,
 		original_format: InputFormat,
 		native_tool_search: bool,
+		safeguards: Option<Arc<types::safeguards::SafeguardsReviewPlan>>,
 		mut req: T,
 		mut parts: Parts,
 		mut managed_body: Body,
@@ -2404,6 +2457,7 @@ impl AIProvider {
 			},
 		)?;
 		llm_info.provider_state = rendered.provider_state;
+		llm_info.safeguards = safeguards;
 		// Couldn't find a better place to apply it, needs to be after rendered. but before generating the request.
 		let body = match policies {
 			Some(p) => p.apply_final_transformations(rendered.body, log)?,
@@ -2631,6 +2685,25 @@ impl AIProvider {
 		};
 
 		parts.headers.remove(header::CONTENT_LENGTH);
+		// Claude Code safeguards: a locally handled (non-native) Messages
+		// response gets its completed tool uses classified and, in enforce
+		// mode, `safeguard_results` stamped at the top level. Failures are
+		// verdicts, never errors on the agent's turn.
+		let body = match (&req.safeguards, req.input_format, parts.status.is_success()) {
+			(Some(plan), InputFormat::Messages, true) => {
+				safeguards::stamp_buffered(
+					plan.clone(),
+					body,
+					safeguards::EvalContext::for_response(
+						client.inputs.metrics.clone(),
+						rate_limit.request_traceparent.as_ref(),
+						plan.identity.clone(),
+					),
+				)
+				.await
+			},
+			_ => body,
+		};
 		let llm_info = LLMInfo::new(req, llm_resp);
 		parts
 			.extensions
@@ -3118,6 +3191,9 @@ impl AIProvider {
 		} = logging;
 		let model = req.request_model.clone();
 		let input_format = req.input_format;
+		let safeguards_plan = req.safeguards.clone();
+		let safeguards_trace_id =
+			safeguards::trace_id_from_traceparent(response_policies.request_traceparent.as_ref());
 		let bedrock_tool_name_map = bedrock_tool_name_map(&req).cloned();
 		let namespaces = namespace_tool_map(&req).cloned();
 		let chat_translation = if input_format.is_chat() {
@@ -3232,6 +3308,24 @@ impl AIProvider {
 					)));
 				},
 			}
+		};
+
+		// Claude Code safeguards: hold the final `message_delta` of a locally
+		// handled Messages stream until the tool uses are classified, then stamp
+		// `safeguard_results` into it (shadow mode never holds). The usage
+		// logger stays owned by the translated body underneath.
+		let translated = match (safeguards_plan, input_format) {
+			(Some(plan), InputFormat::Messages) => {
+				let ctx = safeguards::EvalContext::for_stream(
+					client.inputs.metrics.clone(),
+					safeguards_trace_id,
+					plan.identity.clone(),
+				);
+				translated.map(|b| {
+					b.transform_stream(|b| safeguards::stream::SafeguardsSseBody::new(b, plan, ctx, buffer))
+				})
+			},
+			_ => translated,
 		};
 
 		if !evaluators.is_empty() {

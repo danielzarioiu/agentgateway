@@ -166,6 +166,35 @@ pub struct CostCatalogLookupLabels {
 	pub common: EncodeArc<GenAILabels>,
 }
 
+/// Claude Code safeguards (server-side classifier review). Labels are static
+/// vocabularies plus the classifier provider/model; never tool names or content.
+#[derive(Clone, Hash, Default, Debug, PartialEq, Eq, EncodeLabelSet)]
+pub struct SafeguardsRequestLabels {
+	pub decision: &'static str,
+}
+
+#[derive(Clone, Hash, Default, Debug, PartialEq, Eq, EncodeLabelSet)]
+pub struct SafeguardsVerdictLabels {
+	pub provider: String,
+	pub model: String,
+	pub mode: &'static str,
+	pub verdict: &'static str,
+}
+
+#[derive(Clone, Hash, Default, Debug, PartialEq, Eq, EncodeLabelSet)]
+pub struct SafeguardsCallLabels {
+	pub provider: String,
+	pub model: String,
+	pub result: &'static str,
+}
+
+#[derive(Clone, Hash, Default, Debug, PartialEq, Eq, EncodeLabelSet)]
+pub struct SafeguardsTokenLabels {
+	pub provider: String,
+	pub model: String,
+	pub direction: &'static str,
+}
+
 #[derive(Clone, Hash, Debug, PartialEq, Eq, EncodeLabelSet)]
 pub struct MCPCall {
 	pub method: DefaultedUnknown<RichStrng>,
@@ -332,6 +361,14 @@ pub struct Metrics {
 
 	pub cost_catalog_lookups: Family<CostCatalogLookupLabels, counter::Counter>,
 
+	// Claude Code safeguards: per-request decision, per-tool-use verdicts,
+	// classifier round trips (count, latency, tokens).
+	pub safeguards_requests: Family<SafeguardsRequestLabels, counter::Counter>,
+	pub safeguards_verdicts: Family<SafeguardsVerdictLabels, counter::Counter>,
+	pub safeguards_classifier_calls: Family<SafeguardsCallLabels, counter::Counter>,
+	pub safeguards_classifier_duration: Histogram<SafeguardsCallLabels>,
+	pub safeguards_classifier_tokens: Family<SafeguardsTokenLabels, counter::Counter>,
+
 	// metrics for request retries
 	pub retries: Counter,
 
@@ -493,6 +530,51 @@ impl Metrics {
 				registry.register(
 					"cost_catalog_lookups",
 					"Total number of model cost catalog lookups by resolution status",
+					m.clone(),
+				);
+				m
+			},
+			safeguards_requests: {
+				let m = Family::<SafeguardsRequestLabels, _>::default();
+				registry.register(
+					"safeguards_requests",
+					"Claude Code safeguards requests by gateway decision",
+					m.clone(),
+				);
+				m
+			},
+			safeguards_verdicts: {
+				let m = Family::<SafeguardsVerdictLabels, _>::default();
+				registry.register(
+					"safeguards_verdicts",
+					"Claude Code safeguards per-tool-use verdicts by classifier and mode",
+					m.clone(),
+				);
+				m
+			},
+			safeguards_classifier_calls: {
+				let m = Family::<SafeguardsCallLabels, _>::default();
+				registry.register(
+					"safeguards_classifier_calls",
+					"Safeguards classifier round trips by result",
+					m.clone(),
+				);
+				m
+			},
+			safeguards_classifier_duration: {
+				let m = histogram_family(histogram_mode, &REQUEST_DURATION_BUCKET);
+				registry.register(
+					"safeguards_classifier_duration",
+					"Safeguards classifier round-trip latency in seconds",
+					m.clone(),
+				);
+				m
+			},
+			safeguards_classifier_tokens: {
+				let m = Family::<SafeguardsTokenLabels, _>::default();
+				registry.register(
+					"safeguards_classifier_tokens",
+					"Safeguards classifier tokens reported by the provider (input is billable)",
 					m.clone(),
 				);
 				m

@@ -134,6 +134,10 @@ pub async fn run_with_ui_assets(
 	// refresh with last-known-good; no-op when the URL env is unset, so
 	// deployments without the artifact keep the env-only guard unchanged.
 	crate::llm::tool_search_policy::spawn_policy_refresher();
+	// Claude Code safeguards (default disabled); the model probe only runs when a
+	// classifier is configured.
+	crate::llm::safeguards::init_from_env();
+	crate::llm::safeguards::spawn_model_verification();
 
 	let mut xds_rx_for_task = xds_rx.clone();
 	tokio::spawn(async move {
