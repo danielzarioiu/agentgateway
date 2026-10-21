@@ -3637,6 +3637,7 @@ mod tests {
 	#[test]
 	fn llm_span_emits_cache_write_ttl_split_attributes() {
 		let request = llm::LLMRequest {
+			safeguards: None,
 			input_tokens: None,
 			input_format: InputFormat::Messages,
 			cache_convention: llm::CacheTokenConvention::InputExcludesCache,
@@ -3711,6 +3712,7 @@ mod tests {
 		log.llm_request = Some(request);
 		log.llm_response.store(Some(llm::LLMInfo::new(
 			llm::LLMRequest {
+				safeguards: None,
 				input_tokens: None,
 				input_format: InputFormat::Messages,
 				cache_convention: llm::CacheTokenConvention::InputExcludesCache,
