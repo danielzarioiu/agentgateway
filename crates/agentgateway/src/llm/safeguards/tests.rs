@@ -497,6 +497,54 @@ fn identity_comes_from_verified_jwt_sub_only() {
 	assert_eq!(identity_from_claims(None), None);
 }
 
+fn test_claims_with_sub(sub: &str) -> crate::http::jwt::Claims {
+	crate::http::jwt::Claims {
+		inner: serde_json::from_value(json!({ "sub": sub })).unwrap(),
+		jwt: SecretString::from("redacted".to_string()),
+	}
+}
+
+/// Production surfaces authenticate through the Gatekeeper ext-authz
+/// boundary (no local JWT validation, no `Claims` extension): the identity
+/// is the trusted `x-synapse-subject` header (overwritten/stripped by the
+/// boundary, never spoofable). Local claims remain the fallback for
+/// JWT-authenticated surfaces, and a blank header never shadows them.
+#[test]
+fn identity_comes_from_the_gatekeeper_subject_header_or_claims() {
+	// Header alone (the ext-authz case) is sufficient.
+	assert_eq!(
+		identity_from_parts(None, Some("b37456ad-pilot-sub")).as_deref(),
+		Some("b37456ad-pilot-sub")
+	);
+	// The verified header wins when both are present.
+	assert_eq!(
+		identity_from_parts(
+			Some(&test_claims_with_sub("claims-sub")),
+			Some("header-sub")
+		)
+		.as_deref(),
+		Some("header-sub")
+	);
+	// Blank/whitespace headers are ignored, claims still apply.
+	assert_eq!(
+		identity_from_parts(Some(&test_claims_with_sub("claims-sub")), Some("   ")).as_deref(),
+		Some("claims-sub")
+	);
+	assert_eq!(
+		identity_from_parts(Some(&test_claims_with_sub("claims-sub")), None).as_deref(),
+		Some("claims-sub")
+	);
+	// Neither source present: no identity (fail closed).
+	assert_eq!(identity_from_parts(None, None), None);
+	assert_eq!(identity_from_parts(None, Some("")).as_deref(), None);
+	// A request that never authenticates can never produce the configured
+	// identity through the header path alone.
+	assert_ne!(
+		identity_from_parts(None, Some("b37456ad-pilot-sub")).as_deref(),
+		identity_from_parts(None, None).as_deref()
+	);
+}
+
 // ---------------------------------------------------------------------------
 // Request-side decision
 // ---------------------------------------------------------------------------

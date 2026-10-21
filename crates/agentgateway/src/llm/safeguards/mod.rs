@@ -659,6 +659,29 @@ pub fn identity_from_claims(claims: Option<&crate::http::jwt::Claims>) -> Option
 		.map(str::to_string)
 }
 
+/// Trusted identity header injected by the Synapse Gatekeeper ext-authz
+/// boundary (ADR-077): the raw JWT `sub` of the authenticated principal. On
+/// allow the Gatekeeper OVERWRITES this header and STRIPS every other
+/// client-sent `x-synapse-*` header, so it can never be spoofed.
+pub const IDENTITY_HEADER_SUBJECT: &str = "x-synapse-subject";
+
+/// Identity of the request under two authentication regimes: surfaces with
+/// local JWT validation expose `Claims`; the Synapse surfaces authenticate
+/// through the Gatekeeper ext-authz boundary, which injects
+/// [`IDENTITY_HEADER_SUBJECT`] instead. The verified header wins (it exists
+/// exactly when the boundary authenticated the request); local claims are
+/// the fallback for JWT-authenticated surfaces.
+pub fn identity_from_parts(
+	claims: Option<&crate::http::jwt::Claims>,
+	subject_header: Option<&str>,
+) -> Option<String> {
+	let header = subject_header
+		.map(str::trim)
+		.filter(|s| !s.is_empty())
+		.map(str::to_string);
+	header.or_else(|| identity_from_claims(claims))
+}
+
 // ---------------------------------------------------------------------------
 // Evaluation (response side)
 // ---------------------------------------------------------------------------

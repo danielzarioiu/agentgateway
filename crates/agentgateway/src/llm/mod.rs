@@ -1848,7 +1848,13 @@ impl AIProvider {
 			let request_model = req.model.clone().unwrap_or_default();
 			let requested = types::safeguards::requested_dangerous_tool_use(&req.rest);
 			let runtime = safeguards::runtime();
-			let identity = safeguards::identity_from_claims(parts.extensions.get::<Claims>());
+			let identity = safeguards::identity_from_parts(
+				parts.extensions.get::<Claims>(),
+				parts
+					.headers
+					.get(safeguards::IDENTITY_HEADER_SUBJECT)
+					.and_then(|v| v.to_str().ok()),
+			);
 			let decision = safeguards::decide(
 				&runtime.config,
 				requested.is_some(),
