@@ -1854,6 +1854,10 @@ impl AIProvider {
 					.headers
 					.get(safeguards::IDENTITY_HEADER_SUBJECT)
 					.and_then(|v| v.to_str().ok()),
+				parts
+					.headers
+					.get(::http::header::AUTHORIZATION)
+					.and_then(|v| v.to_str().ok()),
 			);
 			let decision = safeguards::decide(
 				&runtime.config,

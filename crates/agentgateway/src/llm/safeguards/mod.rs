@@ -665,21 +665,52 @@ pub fn identity_from_claims(claims: Option<&crate::http::jwt::Claims>) -> Option
 /// client-sent `x-synapse-*` header, so it can never be spoofed.
 pub const IDENTITY_HEADER_SUBJECT: &str = "x-synapse-subject";
 
-/// Identity of the request under two authentication regimes: surfaces with
-/// local JWT validation expose `Claims`; the Synapse surfaces authenticate
-/// through the Gatekeeper ext-authz boundary, which injects
-/// [`IDENTITY_HEADER_SUBJECT`] instead. The verified header wins (it exists
-/// exactly when the boundary authenticated the request); local claims are
-/// the fallback for JWT-authenticated surfaces.
+/// Identity of the request under the authentication regimes this gateway
+/// runs, in order of verification strength:
+///   1. [`IDENTITY_HEADER_SUBJECT`] — injected by the Gatekeeper ext-authz
+///      boundary AFTER authentication, where that boundary runs before the
+///      LLM phase;
+///   2. local `Claims` — surfaces with their own JWT validation;
+///   3. the raw bearer `sub` — surfaces (the production claude listeners)
+///      whose Gatekeeper ext-authz runs at BACKEND-CALL time, i.e. after
+///      this decision: the PreRouting transformation has already normalized
+///      the credential into `Authorization`, and the boundary verifies that
+///      exact token later. Parsing it here without signature validation can
+///      only ADMIT a request into classification (never into inference): a
+///      forged token still dies at the boundary before any verdict is
+///      served, and the allowlist stays fail-closed.
 pub fn identity_from_parts(
 	claims: Option<&crate::http::jwt::Claims>,
 	subject_header: Option<&str>,
+	authorization: Option<&str>,
 ) -> Option<String> {
 	let header = subject_header
 		.map(str::trim)
 		.filter(|s| !s.is_empty())
 		.map(str::to_string);
-	header.or_else(|| identity_from_claims(claims))
+	header
+		.or_else(|| identity_from_claims(claims))
+		.or_else(|| identity_from_bearer(authorization))
+}
+
+/// `sub` of the bearer JWT in an `Authorization` header, decoded from the
+/// payload WITHOUT signature validation (see [`identity_from_parts`]).
+pub fn identity_from_bearer(authorization: Option<&str>) -> Option<String> {
+	use base64::Engine as _;
+	use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+	let value = authorization?;
+	let token = value.trim();
+	let rest = token
+		.get(..7)
+		.filter(|p| p.eq_ignore_ascii_case("bearer "))
+		.map(|_| &token[7..])
+		.unwrap_or(token);
+	let payload_b64 = rest.split('.').nth(1)?;
+	let payload = URL_SAFE_NO_PAD
+		.decode(payload_b64.trim_end_matches('='))
+		.ok()?;
+	let parsed: Value = serde_json::from_slice(&payload).ok()?;
+	parsed.get("sub")?.as_str().map(str::to_string)
 }
 
 // ---------------------------------------------------------------------------

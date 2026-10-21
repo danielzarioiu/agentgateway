@@ -513,35 +513,95 @@ fn test_claims_with_sub(sub: &str) -> crate::http::jwt::Claims {
 fn identity_comes_from_the_gatekeeper_subject_header_or_claims() {
 	// Header alone (the ext-authz case) is sufficient.
 	assert_eq!(
-		identity_from_parts(None, Some("b37456ad-pilot-sub")).as_deref(),
+		identity_from_parts(None, Some("b37456ad-pilot-sub"), None).as_deref(),
 		Some("b37456ad-pilot-sub")
 	);
 	// The verified header wins when both are present.
 	assert_eq!(
 		identity_from_parts(
 			Some(&test_claims_with_sub("claims-sub")),
-			Some("header-sub")
+			Some("header-sub"),
+			None
 		)
 		.as_deref(),
 		Some("header-sub")
 	);
 	// Blank/whitespace headers are ignored, claims still apply.
 	assert_eq!(
-		identity_from_parts(Some(&test_claims_with_sub("claims-sub")), Some("   ")).as_deref(),
+		identity_from_parts(Some(&test_claims_with_sub("claims-sub")), Some("   "), None).as_deref(),
 		Some("claims-sub")
 	);
 	assert_eq!(
-		identity_from_parts(Some(&test_claims_with_sub("claims-sub")), None).as_deref(),
+		identity_from_parts(Some(&test_claims_with_sub("claims-sub")), None, None).as_deref(),
 		Some("claims-sub")
 	);
 	// Neither source present: no identity (fail closed).
-	assert_eq!(identity_from_parts(None, None), None);
-	assert_eq!(identity_from_parts(None, Some("")).as_deref(), None);
+	assert_eq!(identity_from_parts(None, None, None), None);
+	assert_eq!(identity_from_parts(None, Some(""), None).as_deref(), None);
 	// A request that never authenticates can never produce the configured
 	// identity through the header path alone.
 	assert_ne!(
-		identity_from_parts(None, Some("b37456ad-pilot-sub")).as_deref(),
-		identity_from_parts(None, None).as_deref()
+		identity_from_parts(None, Some("b37456ad-pilot-sub"), None).as_deref(),
+		identity_from_parts(None, None, None).as_deref()
+	);
+}
+
+/// The production claude listeners authenticate via the Gatekeeper
+/// ext-authz at BACKEND-CALL time — after this decision. The PreRouting
+/// transformation has normalized the credential into `Authorization`, so
+/// the bearer payload's `sub` is the only identity available at decision
+/// time there; the boundary verifies the same token before anything is
+/// served.
+#[test]
+fn identity_falls_back_to_the_bearer_payload_sub() {
+	use base64::Engine as _;
+	let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+		.encode(json!({ "sub": "b37456ad-pilot-sub", "iss": "https://issuer.test" }).to_string());
+	let jwt = format!("eyJhbGciOiJSUzI1NiJ9.{payload}.c2ln");
+	assert_eq!(
+		identity_from_parts(None, None, Some(&format!("Bearer {jwt}"))).as_deref(),
+		Some("b37456ad-pilot-sub")
+	);
+	// Lower-case scheme and no scheme both parse.
+	assert_eq!(
+		identity_from_parts(None, None, Some(&format!("bearer {jwt}"))).as_deref(),
+		Some("b37456ad-pilot-sub")
+	);
+	assert_eq!(
+		identity_from_parts(None, None, Some(jwt.as_str())).as_deref(),
+		Some("b37456ad-pilot-sub")
+	);
+	// Precedence: verified header, then claims, then bearer.
+	assert_eq!(
+		identity_from_parts(
+			Some(&test_claims_with_sub("claims-sub")),
+			None,
+			Some(&format!("Bearer {jwt}"))
+		)
+		.as_deref(),
+		Some("claims-sub")
+	);
+	// Garbage never yields an identity.
+	for junk in [
+		"Bearer not.a.jwt",
+		"Bearer eyJhbGciOiJSUzI1NiJ9.###.c2ln",
+		"Basic dXNlcjpwYXNz",
+		"",
+	] {
+		assert_eq!(identity_from_parts(None, None, Some(junk)), None, "{junk}");
+	}
+	assert_eq!(identity_from_parts(None, None, None), None);
+	// A bearer without a sub claim yields no identity.
+	let no_sub = base64::engine::general_purpose::URL_SAFE_NO_PAD
+		.encode(json!({ "iss": "https://issuer.test" }).to_string());
+	assert_eq!(
+		identity_from_parts(
+			None,
+			None,
+			Some(&format!("Bearer eyJhbGciOiJSUzI1NiJ9.{no_sub}.c2ln"))
+		)
+		.as_deref(),
+		None
 	);
 }
 
