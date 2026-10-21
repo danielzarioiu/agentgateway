@@ -3629,7 +3629,6 @@ mod tests {
 		assert!(exporter.finished_spans().is_empty());
 	}
 
-	#[test]
 	/// The per-TTL cache-write split reaches the span attributes exactly as
 	/// reported (Accounting tap contract `cache_write_5m/1h_tokens`); an
 	/// aggregate-only response leaves the split attributes absent — never
@@ -3747,6 +3746,7 @@ mod tests {
 		);
 	}
 
+	#[test]
 	fn llm_span_uses_cache_inclusive_input_tokens() {
 		let request = llm::LLMRequest {
 			input_tokens: None,
