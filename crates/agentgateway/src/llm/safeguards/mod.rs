@@ -610,6 +610,15 @@ impl Decision {
 			Decision::Classify { shadow: false } => "enforce",
 		}
 	}
+
+	/// The two `Untouched` deny reasons — the cases where a redacted
+	/// identity-resolution diagnostic is worth a log line.
+	pub fn is_denied(&self) -> bool {
+		matches!(
+			self,
+			Decision::Untouched("route_denied") | Decision::Untouched("identity_denied")
+		)
+	}
 }
 
 /// Pure per-attempt decision.
@@ -679,18 +688,29 @@ pub const IDENTITY_HEADER_SUBJECT: &str = "x-synapse-subject";
 ///      only ADMIT a request into classification (never into inference): a
 ///      forged token still dies at the boundary before any verdict is
 ///      served, and the allowlist stays fail-closed.
+///
+/// Returns the matched source (`header` | `claims` | `bearer`) alongside
+/// the identity so the deny path can report WHICH source was (not) found —
+/// source names only, never identity values.
 pub fn identity_from_parts(
 	claims: Option<&crate::http::jwt::Claims>,
 	subject_header: Option<&str>,
 	authorization: Option<&str>,
-) -> Option<String> {
+) -> (Option<String>, &'static str) {
 	let header = subject_header
 		.map(str::trim)
 		.filter(|s| !s.is_empty())
 		.map(str::to_string);
-	header
-		.or_else(|| identity_from_claims(claims))
-		.or_else(|| identity_from_bearer(authorization))
+	if let Some(identity) = header {
+		return (Some(identity), "header");
+	}
+	if let Some(identity) = identity_from_claims(claims) {
+		return (Some(identity), "claims");
+	}
+	if let Some(identity) = identity_from_bearer(authorization) {
+		return (Some(identity), "bearer");
+	}
+	(None, "none")
 }
 
 /// `sub` of the bearer JWT in an `Authorization` header, decoded from the

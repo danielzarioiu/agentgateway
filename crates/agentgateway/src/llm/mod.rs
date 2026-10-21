@@ -1848,7 +1848,7 @@ impl AIProvider {
 			let request_model = req.model.clone().unwrap_or_default();
 			let requested = types::safeguards::requested_dangerous_tool_use(&req.rest);
 			let runtime = safeguards::runtime();
-			let identity = safeguards::identity_from_parts(
+			let (identity, identity_source) = safeguards::identity_from_parts(
 				parts.extensions.get::<Claims>(),
 				parts
 					.headers
@@ -1866,6 +1866,16 @@ impl AIProvider {
 				&request_model,
 				identity.as_deref(),
 			);
+			// Redacted diagnostics: source NAMES only (header|claims|bearer|
+			// none), never identity values — enough to explain a denial.
+			if decision.is_denied() {
+				info!(
+					safeguards.identity_source = identity_source,
+					safeguards.decision = decision.label(),
+					safeguards.request_model = %request_model,
+					"safeguards identity resolution"
+				);
+			}
 			safeguards::record_decision(Some(backend_info.inputs.metrics.as_ref()), decision);
 			match (decision, requested) {
 				(safeguards::Decision::Classify { shadow }, Some(requested)) => {
