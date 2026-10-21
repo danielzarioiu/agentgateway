@@ -652,6 +652,30 @@ pub struct Usage {
 	pub rest: serde_json::Value,
 }
 
+impl Usage {
+	/// Per-TTL cache-write split from the pass-through `usage.cache_creation`
+	/// object (Anthropic-native `ephemeral_5m_input_tokens` /
+	/// `ephemeral_1h_input_tokens`). Read from `rest` so the client-facing
+	/// wire format stays byte-identical — no re-parsed typed field, no key
+	/// reordering. `None` = the provider reported no split; consumers must
+	/// not guess the class from the aggregate.
+	///
+	/// A reported all-zero split next to a small aggregate is the
+	/// provider's authoritative sub-minimum no-op write evidence (observed
+	/// on captured production usage): the classes are authoritative and the
+	/// residual aggregate meters at zero — not an inconsistency to hide.
+	pub fn cache_ttl_split(&self) -> (Option<u64>, Option<u64>) {
+		let cache_creation = self.rest.get("cache_creation");
+		let five_m = cache_creation
+			.and_then(|c| c.get("ephemeral_5m_input_tokens"))
+			.and_then(|v| v.as_u64());
+		let one_h = cache_creation
+			.and_then(|c| c.get("ephemeral_1h_input_tokens"))
+			.and_then(|v| v.as_u64());
+		(five_m, one_h)
+	}
+}
+
 pub fn get_messages_helper(
 	messages: &[RequestMessage],
 	system: &Option<TextBlock>,
@@ -1080,6 +1104,8 @@ impl ResponseType for Response {
 			count_tokens: None,
 			reasoning_tokens: None,
 			cache_creation_input_tokens: self.usage.cache_creation_input_tokens,
+			cache_creation_5m_input_tokens: self.usage.cache_ttl_split().0,
+			cache_creation_1h_input_tokens: self.usage.cache_ttl_split().1,
 			cached_input_tokens: self.usage.cache_read_input_tokens,
 			service_tier: self.usage.service_tier.as_deref().map(Into::into),
 			completion: if log_content.completion {
@@ -1614,6 +1640,23 @@ pub mod typed {
 		/// Cumulative cache read tokens
 		#[serde(skip_serializing_if = "Option::is_none")]
 		pub cache_read_input_tokens: Option<usize>,
+		/// Per-TTL cache-write split, when the provider reports the
+		/// `usage.cache_creation` object on the cumulative delta (Anthropic
+		/// prompt caching: 5m default bucket, 1h extended bucket). Absent
+		/// means the split is unknown — never zero.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		pub cache_creation: Option<CacheCreationSplit>,
+	}
+
+	/// The Anthropic `usage.cache_creation` object: explicit per-TTL
+	/// buckets. A present `Some(0)` bucket is real evidence (the provider
+	/// reported the split); a missing key or object means unknown.
+	#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+	pub struct CacheCreationSplit {
+		#[serde(skip_serializing_if = "Option::is_none")]
+		pub ephemeral_5m_input_tokens: Option<usize>,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		pub ephemeral_1h_input_tokens: Option<usize>,
 	}
 
 	#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -1688,6 +1731,12 @@ pub mod typed {
 		/// The service tier used to serve the request.
 		#[serde(skip_serializing_if = "Option::is_none")]
 		pub service_tier: Option<String>,
+
+		/// Per-TTL cache-write split, when the provider reports the
+		/// `usage.cache_creation` object (see [`CacheCreationSplit`]).
+		/// Absent means the split is unknown — never zero.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		pub cache_creation: Option<CacheCreationSplit>,
 	}
 
 	/// Tool definition. A client-defined custom tool always carries `input_schema` and no `type`
@@ -1856,6 +1905,9 @@ pub mod typed {
 				pages: None,
 				reasoning_tokens: None,
 				cache_creation_input_tokens: self.usage.cache_creation_input_tokens.map(|i| i as u64),
+				// Aggregate-only in this accumulated shape — no split reported.
+				cache_creation_5m_input_tokens: None,
+				cache_creation_1h_input_tokens: None,
 				cached_input_tokens: self.usage.cache_read_input_tokens.map(|i| i as u64),
 				service_tier: self.usage.service_tier.as_deref().map(Into::into),
 				provider_model: Some(agent_core::strng::new(&self.model)),
@@ -1984,6 +2036,7 @@ mod tests {
 				cache_creation_input_tokens: None,
 				cache_read_input_tokens: None,
 				service_tier: None,
+				cache_creation: None,
 			},
 			input_audio_tokens: None,
 			output_audio_tokens: None,
@@ -2043,6 +2096,7 @@ mod tests {
 				cache_creation_input_tokens: None,
 				cache_read_input_tokens: None,
 				service_tier: None,
+				cache_creation: None,
 			},
 			input_audio_tokens: None,
 			output_audio_tokens: None,
