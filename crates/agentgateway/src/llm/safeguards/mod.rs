@@ -668,69 +668,34 @@ pub fn identity_from_claims(claims: Option<&crate::http::jwt::Claims>) -> Option
 		.map(str::to_string)
 }
 
-/// Trusted identity header injected by the Synapse Gatekeeper ext-authz
-/// boundary (ADR-077): the raw JWT `sub` of the authenticated principal. On
-/// allow the Gatekeeper OVERWRITES this header and STRIPS every other
-/// client-sent `x-synapse-*` header, so it can never be spoofed.
-pub const IDENTITY_HEADER_SUBJECT: &str = "x-synapse-subject";
-
-/// Identity of the request under the authentication regimes this gateway
-/// runs, in order of verification strength:
-///   1. [`IDENTITY_HEADER_SUBJECT`] — injected by the Gatekeeper ext-authz
-///      boundary AFTER authentication, where that boundary runs before the
-///      LLM phase;
-///   2. local `Claims` — surfaces with their own JWT validation;
-///   3. the raw bearer `sub` — surfaces (the production claude listeners)
-///      whose Gatekeeper ext-authz runs at BACKEND-CALL time, i.e. after
-///      this decision: the PreRouting transformation has already normalized
-///      the credential into `Authorization`, and the boundary verifies that
-///      exact token later. Parsing it here without signature validation can
-///      only ADMIT a request into classification (never into inference): a
-///      forged token still dies at the boundary before any verdict is
-///      served, and the allowlist stays fail-closed.
+/// Identity of the request, in order of verification strength:
+///   1. the [`crate::http::ext_authz::VerifiedSafeguardsIdentity`] request
+///      extension — attested by a SUCCESSFUL ext-authz check. On the
+///      production claude listeners that check is the route-level Gatekeeper
+///      policy: it runs inside `apply_request_policies` (`proxy/httpproxy.rs`,
+///      route ext-authz) BEFORE the spoof-hardening transformation strips
+///      `Authorization` and every `x-synapse-*` header, and BEFORE the LLM
+///      phase. The capture lives at the boundary (`http/ext_authz.rs`) so the
+///      decision never reads request headers at all;
+///   2. local `Claims` — surfaces with their own JWT validation.
 ///
-/// Returns the matched source (`header` | `claims` | `bearer`) alongside
-/// the identity so the deny path can report WHICH source was (not) found —
+/// There is deliberately no third source. The earlier bearer-payload fallback
+/// is gone: a JWT payload decoded without signature validation is not an
+/// authenticated principal and must never gate a security decision. Returns
+/// the matched source (`ext_authz` | `claims` | `none`) alongside the
+/// identity so the deny path can report WHICH source was (not) found —
 /// source names only, never identity values.
 pub fn identity_from_parts(
 	claims: Option<&crate::http::jwt::Claims>,
-	subject_header: Option<&str>,
-	authorization: Option<&str>,
+	verified: Option<&crate::http::ext_authz::VerifiedSafeguardsIdentity>,
 ) -> (Option<String>, &'static str) {
-	let header = subject_header
-		.map(str::trim)
-		.filter(|s| !s.is_empty())
-		.map(str::to_string);
-	if let Some(identity) = header {
-		return (Some(identity), "header");
+	if let Some(verified) = verified {
+		return (Some(verified.subject.to_string()), "ext_authz");
 	}
 	if let Some(identity) = identity_from_claims(claims) {
 		return (Some(identity), "claims");
 	}
-	if let Some(identity) = identity_from_bearer(authorization) {
-		return (Some(identity), "bearer");
-	}
 	(None, "none")
-}
-
-/// `sub` of the bearer JWT in an `Authorization` header, decoded from the
-/// payload WITHOUT signature validation (see [`identity_from_parts`]).
-pub fn identity_from_bearer(authorization: Option<&str>) -> Option<String> {
-	use base64::Engine as _;
-	use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-	let value = authorization?;
-	let token = value.trim();
-	let rest = token
-		.get(..7)
-		.filter(|p| p.eq_ignore_ascii_case("bearer "))
-		.map(|_| &token[7..])
-		.unwrap_or(token);
-	let payload_b64 = rest.split('.').nth(1)?;
-	let payload = URL_SAFE_NO_PAD
-		.decode(payload_b64.trim_end_matches('='))
-		.ok()?;
-	let parsed: Value = serde_json::from_slice(&payload).ok()?;
-	parsed.get("sub")?.as_str().map(str::to_string)
 }
 
 // ---------------------------------------------------------------------------

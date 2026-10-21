@@ -67,6 +67,37 @@ pub mod proto {
 #[derive(Default, ::cel::DynamicType)]
 pub struct ExtAuthzDynamicMetadata(serde_json::Map<String, JsonValue>);
 
+/// Trusted subject header of the Synapse Gatekeeper boundary (ADR-077): the
+/// raw JWT `sub` the authorizer authenticated. It becomes an identity ONLY
+/// through [`VerifiedSafeguardsIdentity`], captured from the authorization
+/// RESPONSE — never read back from the request headers.
+pub const TRUSTED_SUBJECT_HEADER: &str = "x-synapse-subject";
+
+/// The principal a SUCCESSFUL ext-authz check authenticated, captured from
+/// the authorizer's own response headers at the moment the allow is applied.
+///
+/// Why an extension and not a header: on the production claude listeners the
+/// route-level ext-authz runs inside `apply_request_policies` and the
+/// spoof-hardening transformation that follows it strips `Authorization`
+/// and every `x-synapse-*` header before the LLM phase ever sees the
+/// request (that strip is the defense that makes the headers worthless as
+/// an identity source). Extensions are untouched by header transformations
+/// and are preserved through the LLM snapshot
+/// (`take_and_snapshot_without_clearing_extensions`), so the verified
+/// principal reaches the safeguards decision intact.
+///
+/// Provenance guarantees:
+/// - read from the authorization response only, so a client-supplied
+///   `x-synapse-subject` on a route without ext-authz can never produce one;
+/// - denied, failed (`FailClosed`) and unconfigured checks never insert it;
+/// - each successful check REPLACES it (insert semantics), and every retry
+///   attempt starts from a fresh clone of the post-policy request head, so no
+///   attempt can inherit identity state another attempt established.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedSafeguardsIdentity {
+	pub subject: Arc<str>,
+}
+
 #[apply(schema!)]
 pub struct BodyOptions {
 	/// Maximum request body size to send to the authorization service. Defaults to 8192 bytes.
@@ -1302,6 +1333,7 @@ impl CachedGrpcPolicyResponse {
 				query_parameters_to_remove,
 				dynamic_metadata,
 			} => {
+				let verified = verified_identity_from_proto_headers(&headers);
 				insert_dynamic_metadata(req, dynamic_metadata);
 				for header_name in headers_to_remove {
 					if !header_name.starts_with(':') && header_name.to_lowercase() != "host" {
@@ -1314,6 +1346,9 @@ impl CachedGrpcPolicyResponse {
 					&query_parameters_to_set,
 					&query_parameters_to_remove,
 				)?;
+				if let Some(verified) = verified {
+					req.extensions_mut().insert(verified);
+				}
 				Ok(PolicyResponse {
 					direct_response: None,
 					response_headers,
@@ -1364,10 +1399,14 @@ impl CachedHttpPolicyResponse {
 				headers,
 				dynamic_metadata,
 			} => {
+				let verified = verified_identity_from_header_map(&headers);
 				for (name, value) in headers {
 					if let Some(name) = name {
 						req.headers_mut().insert(name, value);
 					}
+				}
+				if let Some(verified) = verified {
+					req.extensions_mut().insert(verified);
 				}
 				if let Some(dynamic_metadata) = dynamic_metadata {
 					req
@@ -1406,6 +1445,42 @@ fn insert_dynamic_metadata(
 			.extensions_mut()
 			.insert(ExtAuthzDynamicMetadata(dynamic_metadata));
 	}
+}
+
+/// The authenticated subject from the authorizer's `headers_to_add`, if it
+/// emitted [`TRUSTED_SUBJECT_HEADER`]. Last occurrence wins, matching the
+/// replace semantics a single-header emit has on the wire. Reads the
+/// authorization response ONLY: request headers are never consulted.
+fn verified_identity_from_proto_headers(
+	headers: &[HeaderValueOption],
+) -> Option<VerifiedSafeguardsIdentity> {
+	let mut subject = None;
+	for header in headers {
+		let Some(ref h) = header.header else {
+			continue;
+		};
+		if h.key.eq_ignore_ascii_case(TRUSTED_SUBJECT_HEADER) {
+			subject = non_empty_trimmed(&h.value);
+		}
+	}
+	subject.map(|subject| VerifiedSafeguardsIdentity {
+		subject: subject.into(),
+	})
+}
+
+fn verified_identity_from_header_map(headers: &HeaderMap) -> Option<VerifiedSafeguardsIdentity> {
+	headers
+		.get(TRUSTED_SUBJECT_HEADER)
+		.and_then(|value| value.to_str().ok())
+		.and_then(non_empty_trimmed)
+		.map(|subject| VerifiedSafeguardsIdentity {
+			subject: subject.into(),
+		})
+}
+
+fn non_empty_trimmed(value: &str) -> Option<String> {
+	let trimmed = value.trim();
+	(!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn unix_epoch_ttl(expires_at: f64) -> Option<Duration> {

@@ -504,128 +504,119 @@ fn test_claims_with_sub(sub: &str) -> crate::http::jwt::Claims {
 	}
 }
 
+fn verified(subject: &str) -> crate::http::ext_authz::VerifiedSafeguardsIdentity {
+	crate::http::ext_authz::VerifiedSafeguardsIdentity {
+		subject: subject.into(),
+	}
+}
+
 /// Production surfaces authenticate through the Gatekeeper ext-authz
 /// boundary (no local JWT validation, no `Claims` extension): the identity
-/// is the trusted `x-synapse-subject` header (overwritten/stripped by the
-/// boundary, never spoofable). Local claims remain the fallback for
-/// JWT-authenticated surfaces, and a blank header never shadows them.
+/// is the `VerifiedSafeguardsIdentity` extension the boundary inserts from
+/// its own authorization response. Local claims remain the fallback for
+/// JWT-validated surfaces.
 #[test]
-fn identity_comes_from_the_gatekeeper_subject_header_or_claims() {
-	// Header alone (the ext-authz case) is sufficient.
+fn identity_prefers_the_ext_authz_attested_principal() {
+	// The boundary capture alone (the production claude listeners) suffices.
 	assert_eq!(
-		identity_from_parts(None, Some("b37456ad-pilot-sub"), None)
-			.0
-			.as_deref(),
-		Some("b37456ad-pilot-sub")
+		identity_from_parts(None, Some(&verified("b37456ad-pilot-sub"))),
+		(Some("b37456ad-pilot-sub".to_string()), "ext_authz")
 	);
-	// The verified header wins when both are present.
+	// The boundary wins over local claims when both are present.
 	assert_eq!(
 		identity_from_parts(
 			Some(&test_claims_with_sub("claims-sub")),
-			Some("header-sub"),
-			None
-		)
-		.0
-		.as_deref(),
-		Some("header-sub")
+			Some(&verified("boundary-sub"))
+		),
+		(Some("boundary-sub".to_string()), "ext_authz")
 	);
-	// Blank/whitespace headers are ignored, claims still apply.
+	// Claims are the fallback for JWT-validated surfaces.
 	assert_eq!(
-		identity_from_parts(Some(&test_claims_with_sub("claims-sub")), Some("   "), None)
-			.0
-			.as_deref(),
-		Some("claims-sub")
-	);
-	assert_eq!(
-		identity_from_parts(Some(&test_claims_with_sub("claims-sub")), None, None)
-			.0
-			.as_deref(),
-		Some("claims-sub")
+		identity_from_parts(Some(&test_claims_with_sub("claims-sub")), None),
+		(Some("claims-sub".to_string()), "claims")
 	);
 	// Neither source present: no identity (fail closed).
-	assert_eq!(identity_from_parts(None, None, None).0, None);
-	assert_eq!(identity_from_parts(None, None, None).1, "none");
-	assert_eq!(identity_from_parts(None, Some(""), None).0.as_deref(), None);
-	// A request that never authenticates can never produce the configured
-	// identity through the header path alone.
-	assert_ne!(
-		identity_from_parts(None, Some("b37456ad-pilot-sub"), None)
-			.0
-			.as_deref(),
-		identity_from_parts(None, None, None).0.as_deref()
+	assert_eq!(identity_from_parts(None, None), (None, "none"));
+}
+
+/// The allowlist only ever sees principals a boundary attested: the
+/// resolution input is the ext-authz capture and validated claims — nothing
+/// else. The removed bearer-payload fallback is enforced by the signature
+/// (no `Authorization` parameter); a client-supplied `x-synapse-subject`
+/// never becomes an identity because only the authorizer's response
+/// produces the capture (see `ext_authz_tests`).
+#[test]
+fn identity_allowlist_admits_only_boundary_attested_principals() {
+	let pilot = pilot_config(Mode::Enforce);
+	// Attested pilot: classification allowed.
+	let pilot_sub = identity_from_parts(None, Some(&verified("user-pilot"))).0;
+	assert_eq!(
+		decide(&pilot, true, false, "zai.glm-5.3", pilot_sub.as_deref()),
+		Decision::Classify { shadow: false }
+	);
+	// Subject mismatch: an attested principal outside the allowlist keeps
+	// the exact pre-existing request/response behavior, just unclassified.
+	let other_sub = identity_from_parts(None, Some(&verified("user-other"))).0;
+	assert_eq!(
+		decide(&pilot, true, false, "zai.glm-5.3", other_sub.as_deref()),
+		Decision::Untouched("identity_denied")
+	);
+	// No attestation (unauthenticated / denied / skipped / scrubbed
+	// request): nothing to match, fail closed.
+	let none = identity_from_parts(None, None).0;
+	assert_eq!(
+		decide(&pilot, true, false, "zai.glm-5.3", none.as_deref()),
+		Decision::Untouched("identity_denied")
+	);
+	// Empty allowlist: nobody, attested or not.
+	let nobody = SafeguardsConfig {
+		identities: Vec::new(),
+		..pilot_config(Mode::Enforce)
+	};
+	assert_eq!(
+		decide(&nobody, true, false, "zai.glm-5.3", pilot_sub.as_deref()),
+		Decision::Untouched("identity_denied")
 	);
 }
 
-/// The production claude listeners authenticate via the Gatekeeper
-/// ext-authz at BACKEND-CALL time — after this decision. The PreRouting
-/// transformation has normalized the credential into `Authorization`, so
-/// the bearer payload's `sub` is the only identity available at decision
-/// time there; the boundary verifies the same token before anything is
-/// served.
+/// The production route globs are exact per model id: a Flash variant never
+/// matches even though it shares the prefix, and the alias-resolved GLM 5.3
+/// id is what the filter sees (the request model at this point is
+/// post-alias, cf. llm/mod.rs).
 #[test]
-fn identity_falls_back_to_the_bearer_payload_sub() {
-	use base64::Engine as _;
-	let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-		.encode(json!({ "sub": "b37456ad-pilot-sub", "iss": "https://issuer.test" }).to_string());
-	let jwt = format!("eyJhbGciOiJSUzI1NiJ9.{payload}.c2ln");
+fn production_route_globs_exclude_flash_variants() {
+	let config = SafeguardsConfig {
+		routes: vec![
+			"accounts/fireworks/models/glm-5p3".to_string(),
+			"zai.glm-5.3".to_string(),
+		],
+		..pilot_config(Mode::Enforce)
+	};
+	let pilot = Some("user-pilot");
 	assert_eq!(
-		identity_from_parts(None, None, Some(&format!("Bearer {jwt}")))
-			.0
-			.as_deref(),
-		Some("b37456ad-pilot-sub")
-	);
-	// Lower-case scheme and no scheme both parse.
-	assert_eq!(
-		identity_from_parts(None, None, Some(&format!("bearer {jwt}")))
-			.0
-			.as_deref(),
-		Some("b37456ad-pilot-sub")
+		decide(
+			&config,
+			true,
+			false,
+			"accounts/fireworks/models/glm-5p3",
+			pilot
+		),
+		Decision::Classify { shadow: false }
 	);
 	assert_eq!(
-		identity_from_parts(None, None, Some(jwt.as_str()))
-			.0
-			.as_deref(),
-		Some("b37456ad-pilot-sub")
+		decide(&config, true, false, "zai.glm-5.3", pilot),
+		Decision::Classify { shadow: false }
 	);
-	// Precedence: verified header, then claims, then bearer.
-	assert_eq!(
-		identity_from_parts(
-			Some(&test_claims_with_sub("claims-sub")),
-			None,
-			Some(&format!("Bearer {jwt}"))
-		)
-		.0
-		.as_deref(),
-		Some("claims-sub")
-	);
-	// Garbage never yields an identity.
-	for junk in [
-		"Bearer not.a.jwt",
-		"Bearer eyJhbGciOiJSUzI1NiJ9.###.c2ln",
-		"Basic dXNlcjpwYXNz",
-		"",
+	for flash in [
+		"accounts/fireworks/models/glm-5p3-flash",
+		"zai.glm-5.3-flash",
 	] {
 		assert_eq!(
-			identity_from_parts(None, None, Some(junk)).0,
-			None,
-			"{junk}"
+			decide(&config, true, false, flash, pilot),
+			Decision::Untouched("route_denied"),
+			"{flash}"
 		);
 	}
-	assert_eq!(identity_from_parts(None, None, None).0, None);
-	assert_eq!(identity_from_parts(None, None, None).1, "none");
-	// A bearer without a sub claim yields no identity.
-	let no_sub = base64::engine::general_purpose::URL_SAFE_NO_PAD
-		.encode(json!({ "iss": "https://issuer.test" }).to_string());
-	assert_eq!(
-		identity_from_parts(
-			None,
-			None,
-			Some(&format!("Bearer eyJhbGciOiJSUzI1NiJ9.{no_sub}.c2ln"))
-		)
-		.0
-		.as_deref(),
-		None
-	);
 }
 
 // ---------------------------------------------------------------------------

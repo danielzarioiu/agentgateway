@@ -1851,13 +1851,8 @@ impl AIProvider {
 			let (identity, identity_source) = safeguards::identity_from_parts(
 				parts.extensions.get::<Claims>(),
 				parts
-					.headers
-					.get(safeguards::IDENTITY_HEADER_SUBJECT)
-					.and_then(|v| v.to_str().ok()),
-				parts
-					.headers
-					.get(::http::header::AUTHORIZATION)
-					.and_then(|v| v.to_str().ok()),
+					.extensions
+					.get::<crate::http::ext_authz::VerifiedSafeguardsIdentity>(),
 			);
 			let decision = safeguards::decide(
 				&runtime.config,
