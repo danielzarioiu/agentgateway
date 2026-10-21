@@ -594,7 +594,7 @@ fn ext_authz_allow_captures_the_boundary_subject_as_verified_identity() {
 		.extensions()
 		.get::<super::VerifiedSafeguardsIdentity>()
 		.expect("the boundary attests the authenticated subject");
-	assert_eq!(&*verified.subject, "b37456ad-pilot-sub");
+	assert_eq!(&*verified.principal, "b37456ad-pilot-sub");
 	// The header stamping behavior itself is unchanged.
 	assert_eq!(
 		req.headers().get("x-synapse-subject").unwrap(),
@@ -683,7 +683,7 @@ fn ext_authz_http_allow_captures_the_boundary_subject() {
 		.extensions()
 		.get::<super::VerifiedSafeguardsIdentity>()
 		.expect("the http-mode boundary attests the subject too");
-	assert_eq!(&*verified.subject, "http-pilot-sub");
+	assert_eq!(&*verified.principal, "http-pilot-sub");
 }
 
 #[test]
@@ -721,7 +721,103 @@ fn verified_identity_is_replaced_by_each_successful_check() {
 		.extensions()
 		.get::<super::VerifiedSafeguardsIdentity>()
 		.expect("the latest successful check wins");
-	assert_eq!(&*verified.subject, "second-sub");
+	assert_eq!(&*verified.principal, "second-sub");
+}
+
+/// The production claude surface attests the canonical, issuer-qualified
+/// PrincipalId and emits NO bare subject (Gatekeeper `claude surface check`
+/// arm). The capture must take that header — and prefer it when a flow
+/// emits both.
+#[test]
+fn ext_authz_allow_captures_the_canonical_principal_id() {
+	let principal = "oidc:https-issuer.example-realms-r:b37456ad-4465-4dc8-936e-69bc094db5af";
+	let option = |key: &str, value: &str| HeaderValueOption {
+		header: Some(ProtoHeaderValue {
+			key: key.to_string(),
+			value: value.to_string(),
+			raw_value: vec![],
+		}),
+		append: Some(false),
+		append_action: 0,
+	};
+	// Claude-surface shape: principal id + auth method + client family, no subject.
+	let mut req = ::http::Request::builder()
+		.uri("http://example.com/v1/messages")
+		.body(http::Body::empty())
+		.unwrap();
+	let cached = super::CachedGrpcPolicyResponse::Allow {
+		headers: vec![
+			option("x-synapse-principal-type", "principal_context"),
+			option("x-synapse-principal-id", principal),
+			option("x-synapse-auth-method", "oidc"),
+			option("x-synapse-client-family", "claude-code"),
+		],
+		headers_to_remove: vec!["x-synapse-subject".to_string()],
+		response_headers: None,
+		query_parameters_to_set: vec![],
+		query_parameters_to_remove: vec![],
+		dynamic_metadata: None,
+	};
+	let _ = cached.apply(&mut req).unwrap();
+	let verified = req
+		.extensions()
+		.get::<super::VerifiedSafeguardsIdentity>()
+		.expect("the canonical principal id is attested");
+	assert_eq!(&*verified.principal, principal);
+
+	// Both emitted: the canonical id wins over the raw subject.
+	let mut req = ::http::Request::builder()
+		.uri("http://example.com/")
+		.body(http::Body::empty())
+		.unwrap();
+	let cached = super::CachedGrpcPolicyResponse::Allow {
+		headers: vec![
+			option("x-synapse-subject", "raw-sub"),
+			option("X-Synapse-Principal-Id", principal),
+		],
+		headers_to_remove: vec![],
+		response_headers: None,
+		query_parameters_to_set: vec![],
+		query_parameters_to_remove: vec![],
+		dynamic_metadata: None,
+	};
+	let _ = cached.apply(&mut req).unwrap();
+	assert_eq!(
+		&*req
+			.extensions()
+			.get::<super::VerifiedSafeguardsIdentity>()
+			.unwrap()
+			.principal,
+		principal
+	);
+
+	// HTTP-mode boundary: same precedence.
+	let mut req = ::http::Request::builder()
+		.uri("http://example.com/")
+		.body(http::Body::empty())
+		.unwrap();
+	let cached = super::CachedHttpPolicyResponse::Allow {
+		headers: HeaderMap::from_iter([
+			(
+				HeaderName::from_static("x-synapse-subject"),
+				HeaderValue::from_static("raw-sub"),
+			),
+			(
+				HeaderName::from_static("x-synapse-principal-id"),
+				HeaderValue::from_str(principal).unwrap(),
+			),
+		]),
+		dynamic_metadata: None,
+	};
+	let _ = cached.apply(&mut req).unwrap();
+	assert_eq!(
+		&*req
+			.extensions()
+			.get::<super::VerifiedSafeguardsIdentity>()
+			.unwrap()
+			.principal,
+		principal
+	);
 }
 
 #[tokio::test]

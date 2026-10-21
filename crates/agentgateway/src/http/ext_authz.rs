@@ -67,14 +67,20 @@ pub mod proto {
 #[derive(Default, ::cel::DynamicType)]
 pub struct ExtAuthzDynamicMetadata(serde_json::Map<String, JsonValue>);
 
-/// Trusted subject header of the Synapse Gatekeeper boundary (ADR-077): the
-/// raw JWT `sub` the authorizer authenticated. It becomes an identity ONLY
-/// through [`VerifiedSafeguardsIdentity`], captured from the authorization
-/// RESPONSE — never read back from the request headers.
+/// Trusted identity headers of the Synapse Gatekeeper boundary (ADR-077),
+/// captured from the authorization RESPONSE only — never read back from the
+/// request. The claude/LLM surfaces attest the canonical, issuer-qualified
+/// PrincipalId (`oidc:<issuer-slug>:<sub>` for an OIDC caller) and do NOT
+/// emit a bare subject; the MCP flow attests the raw subject. The canonical
+/// id wins when both are present. These only ever become an identity through
+/// [`VerifiedSafeguardsIdentity`].
+pub const TRUSTED_PRINCIPAL_HEADER: &str = "x-synapse-principal-id";
 pub const TRUSTED_SUBJECT_HEADER: &str = "x-synapse-subject";
 
 /// The principal a SUCCESSFUL ext-authz check authenticated, captured from
-/// the authorizer's own response headers at the moment the allow is applied.
+/// the authorizer's own response headers at the moment the allow is applied:
+/// the canonical PrincipalId when the boundary emits one, else the raw
+/// subject. Allowlists match this string verbatim.
 ///
 /// Why an extension and not a header: on the production claude listeners the
 /// route-level ext-authz runs inside `apply_request_policies` and the
@@ -88,14 +94,14 @@ pub const TRUSTED_SUBJECT_HEADER: &str = "x-synapse-subject";
 ///
 /// Provenance guarantees:
 /// - read from the authorization response only, so a client-supplied
-///   `x-synapse-subject` on a route without ext-authz can never produce one;
+///   trusted header on a route without ext-authz can never produce one;
 /// - denied, failed (`FailClosed`) and unconfigured checks never insert it;
 /// - each successful check REPLACES it (insert semantics), and every retry
 ///   attempt starts from a fresh clone of the post-policy request head, so no
 ///   attempt can inherit identity state another attempt established.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedSafeguardsIdentity {
-	pub subject: Arc<str>,
+	pub principal: Arc<str>,
 }
 
 #[apply(schema!)]
@@ -1447,34 +1453,44 @@ fn insert_dynamic_metadata(
 	}
 }
 
-/// The authenticated subject from the authorizer's `headers_to_add`, if it
-/// emitted [`TRUSTED_SUBJECT_HEADER`]. Last occurrence wins, matching the
+/// The authenticated principal from the authorizer's `headers_to_add`: the
+/// canonical [`TRUSTED_PRINCIPAL_HEADER`] when emitted, else the raw
+/// [`TRUSTED_SUBJECT_HEADER`]. Last occurrence of each wins, matching the
 /// replace semantics a single-header emit has on the wire. Reads the
 /// authorization response ONLY: request headers are never consulted.
 fn verified_identity_from_proto_headers(
 	headers: &[HeaderValueOption],
 ) -> Option<VerifiedSafeguardsIdentity> {
+	let mut principal = None;
 	let mut subject = None;
 	for header in headers {
 		let Some(ref h) = header.header else {
 			continue;
 		};
-		if h.key.eq_ignore_ascii_case(TRUSTED_SUBJECT_HEADER) {
+		if h.key.eq_ignore_ascii_case(TRUSTED_PRINCIPAL_HEADER) {
+			principal = non_empty_trimmed(&h.value);
+		} else if h.key.eq_ignore_ascii_case(TRUSTED_SUBJECT_HEADER) {
 			subject = non_empty_trimmed(&h.value);
 		}
 	}
-	subject.map(|subject| VerifiedSafeguardsIdentity {
-		subject: subject.into(),
-	})
+	principal
+		.or(subject)
+		.map(|principal| VerifiedSafeguardsIdentity {
+			principal: principal.into(),
+		})
 }
 
 fn verified_identity_from_header_map(headers: &HeaderMap) -> Option<VerifiedSafeguardsIdentity> {
-	headers
-		.get(TRUSTED_SUBJECT_HEADER)
-		.and_then(|value| value.to_str().ok())
-		.and_then(non_empty_trimmed)
-		.map(|subject| VerifiedSafeguardsIdentity {
-			subject: subject.into(),
+	let attested = |name: &str| {
+		headers
+			.get(name)
+			.and_then(|value| value.to_str().ok())
+			.and_then(non_empty_trimmed)
+	};
+	attested(TRUSTED_PRINCIPAL_HEADER)
+		.or_else(|| attested(TRUSTED_SUBJECT_HEADER))
+		.map(|principal| VerifiedSafeguardsIdentity {
+			principal: principal.into(),
 		})
 }
 

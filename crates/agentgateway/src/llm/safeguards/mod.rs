@@ -676,21 +676,25 @@ pub fn identity_from_claims(claims: Option<&crate::http::jwt::Claims>) -> Option
 ///      route ext-authz) BEFORE the spoof-hardening transformation strips
 ///      `Authorization` and every `x-synapse-*` header, and BEFORE the LLM
 ///      phase. The capture lives at the boundary (`http/ext_authz.rs`) so the
-///      decision never reads request headers at all;
-///   2. local `Claims` — surfaces with their own JWT validation.
+///      decision never reads request headers at all. The attested value is
+///      the boundary's canonical PrincipalId (`oidc:<issuer-slug>:<sub>` on
+///      the claude surface — the Gatekeeper emits no bare subject there), or
+///      the raw subject on flows that attest only that;
+///   2. local `Claims` — surfaces with their own JWT validation (raw `sub`).
 ///
-/// There is deliberately no third source. The earlier bearer-payload fallback
-/// is gone: a JWT payload decoded without signature validation is not an
-/// authenticated principal and must never gate a security decision. Returns
-/// the matched source (`ext_authz` | `claims` | `none`) alongside the
-/// identity so the deny path can report WHICH source was (not) found —
-/// source names only, never identity values.
+/// Allowlist entries are matched verbatim against the attested string of the
+/// surface in use. There is deliberately no third source. The earlier
+/// bearer-payload fallback is gone: a JWT payload decoded without signature
+/// validation is not an authenticated principal and must never gate a
+/// security decision. Returns the matched source (`ext_authz` | `claims` |
+/// `none`) alongside the identity so the deny path can report WHICH source
+/// was (not) found — source names only, never identity values.
 pub fn identity_from_parts(
 	claims: Option<&crate::http::jwt::Claims>,
 	verified: Option<&crate::http::ext_authz::VerifiedSafeguardsIdentity>,
 ) -> (Option<String>, &'static str) {
 	if let Some(verified) = verified {
-		return (Some(verified.subject.to_string()), "ext_authz");
+		return (Some(verified.principal.to_string()), "ext_authz");
 	}
 	if let Some(identity) = identity_from_claims(claims) {
 		return (Some(identity), "claims");

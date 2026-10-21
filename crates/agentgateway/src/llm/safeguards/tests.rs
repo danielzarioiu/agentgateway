@@ -506,7 +506,7 @@ fn test_claims_with_sub(sub: &str) -> crate::http::jwt::Claims {
 
 fn verified(subject: &str) -> crate::http::ext_authz::VerifiedSafeguardsIdentity {
 	crate::http::ext_authz::VerifiedSafeguardsIdentity {
-		subject: subject.into(),
+		principal: subject.into(),
 	}
 }
 
