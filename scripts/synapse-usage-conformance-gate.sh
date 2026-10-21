@@ -69,6 +69,29 @@ cp "$GATE_REPO/crates/llm/src/conversion/messages_tests.rs" \
 cp "$GATE_REPO/crates/agentgateway/src/llm/usage_extraction_tests.rs" \
    "$WORK/candidate/crates/agentgateway/src/llm/usage_extraction_synapse_conformance_tests.rs"
 
+# --------------------------------------------------- harness drift port
+# A candidate that EXTENDS LLMRequest with a new field makes the golden
+# initializer in messages_synapse_conformance_tests.rs fail to COMPILE, so
+# Tier 1 reports FAIL with 0 tests instead of measuring semantics. Each port
+# below is conditional on the field existing in the candidate: a pre-field
+# candidate (e.g. a rollback target) still compiles the byte-original golden
+# file. Only the initializer is extended; no expectation is touched.
+#   2026-10-21: `safeguards` (Claude Code Auto Mode server-side safeguards
+#   review-plan carrier, fork PR #8; first candidate
+#   v1.6.0-synapse-compat2-rc3-tsguard5-safeguards1).
+MS_GOLDEN="$WORK/candidate/crates/llm/src/conversion/messages_synapse_conformance_tests.rs"
+if grep -qE '^[[:space:]]*pub safeguards:' "$WORK/candidate/crates/llm/src/lib.rs"; then
+  python3 - "$MS_GOLDEN" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+anchor = "\t\t\tprovider_state: None,\n"
+assert src.count(anchor) == 1, "golden LLMRequest initializer anchor is not unique"
+open(path, "w").write(src.replace(anchor, anchor + "\t\t\tsafeguards: None,\n"))
+PY
+  echo "harness port: candidate LLMRequest has \`safeguards\` -> golden initializer extended"
+fi
+
 graft_decl() { # file, declaration
   grep -qF "$2" "$1" || printf '\n%s\n' "$2" >> "$1"
 }
