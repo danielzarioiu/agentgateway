@@ -1020,6 +1020,7 @@ mod tests {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
 		}
 	}
 

@@ -75,6 +75,7 @@ fn llm_request_with_tokens(input_tokens: Option<u64>) -> LLMRequest {
 		params: Default::default(),
 		prompt: None,
 		provider_state: None,
+		safeguards: None,
 	}
 }
 
@@ -1640,6 +1641,7 @@ fn gemini_count_tokens_response_reports_total_tokens() {
 		params: Default::default(),
 		prompt: None,
 		provider_state: None,
+		safeguards: None,
 	};
 	let body = br#"{"totalTokens":31,"promptTokensDetails":[{"modality":"TEXT","tokenCount":31}]}"#;
 	let buffered = BufferedResponse {
@@ -1678,6 +1680,7 @@ async fn anthropic_count_tokens_preserves_upstream_errors() {
 		params: Default::default(),
 		prompt: None,
 		provider_state: None,
+		safeguards: None,
 	};
 	let body =
 		bytes::Bytes::from_static(br#"{"message":"The provided model does not support CountTokens"}"#);
@@ -2588,6 +2591,7 @@ async fn process_response_routes_streaming_error_to_buffered_path() {
 		params: Default::default(),
 		prompt: None,
 		provider_state: None,
+		safeguards: None,
 	};
 
 	let body = Body::from(error_json.as_bytes().to_vec());
@@ -2882,6 +2886,7 @@ async fn process_streaming_bedrock_completions_normalizes_sse_headers_and_done()
 				params: Default::default(),
 				prompt: None,
 				provider_state: None,
+				safeguards: None,
 			},
 			LLMResponsePolicies::default(),
 			None,
@@ -2991,6 +2996,7 @@ fn setup_request_custom_path_override_wins_over_format_path() {
 		params: Default::default(),
 		prompt: None,
 		provider_state: None,
+		safeguards: None,
 	};
 	let mut req = crate::http::tests_common::request(
 		"https://proxy.example.com/v1/chat/completions?trace=repro",
@@ -3027,6 +3033,7 @@ fn setup_request_drops_inbound_query_only_when_translated() {
 		params: Default::default(),
 		prompt: None,
 		provider_state: None,
+		safeguards: None,
 	};
 	for (provider, route_type, expected_query) in [
 		(
@@ -3103,6 +3110,7 @@ fn setup_request_custom_generate_content_defaults_to_the_native_path() {
 			params: Default::default(),
 			prompt: None,
 			provider_state: Some(ProviderState::VertexGemini),
+			safeguards: None,
 		};
 		let mut req = crate::http::tests_common::request(
 			"https://gemini.example.com/v1beta/models/gemini-2.5-flash:generateContent",
@@ -3143,6 +3151,7 @@ fn setup_request_custom_count_tokens_defaults_to_the_native_path() {
 		params: Default::default(),
 		prompt: None,
 		provider_state: None,
+		safeguards: None,
 	};
 	let mut req = crate::http::tests_common::request(
 		"https://gemini.example.com/v1beta/models/gemini-2.5-flash:countTokens",
@@ -3181,6 +3190,7 @@ fn llm_request_for_path(request_model: &str) -> LLMRequest {
 		params: Default::default(),
 		prompt: None,
 		provider_state: None,
+		safeguards: None,
 	}
 }
 
@@ -3225,6 +3235,7 @@ fn native_gemini_llm_request(request_model: &str, streaming: bool) -> LLMRequest
 		params: Default::default(),
 		prompt: None,
 		provider_state: Some(ProviderState::VertexGemini),
+		safeguards: None,
 	}
 }
 
@@ -3352,6 +3363,7 @@ fn setup_request_gemini_without_native_state_keeps_compat_path() {
 	let llm_request = LLMRequest {
 		input_format: InputFormat::Completions,
 		provider_state: None,
+		safeguards: None,
 		..native_gemini_llm_request("gemini-2.5-flash", false)
 	};
 	let mut req = crate::http::tests_common::request(
@@ -3542,6 +3554,7 @@ async fn bedrock_from_messages_stream_captures_completion() {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
 		},
 		response: LLMResponse::default(),
 	};
@@ -3592,6 +3605,7 @@ async fn bedrock_from_messages_stream_skips_completion_when_disabled() {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
 		},
 		response: LLMResponse::default(),
 	};
@@ -3639,6 +3653,7 @@ async fn bedrock_from_messages_stream_captures_tool_calls() {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
 		},
 		response: LLMResponse::default(),
 	};
@@ -3698,6 +3713,7 @@ async fn messages_passthrough_stream_captures_completion() {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
 		},
 		response: LLMResponse::default(),
 	};
@@ -3746,6 +3762,7 @@ async fn messages_passthrough_stream_skips_completion_when_disabled() {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
 		},
 		response: LLMResponse::default(),
 	};
@@ -3790,6 +3807,7 @@ async fn messages_passthrough_stream_captures_tool_calls() {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
 		},
 		response: LLMResponse::default(),
 	};
@@ -3845,6 +3863,7 @@ async fn responses_passthrough_stream_captures_completion_and_tool_calls() {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
 		},
 		response: LLMResponse::default(),
 	};
@@ -3908,6 +3927,7 @@ data: [DONE]
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
 		},
 		response: LLMResponse::default(),
 	};
@@ -3945,6 +3965,7 @@ async fn responses_passthrough_stream_skips_completion_when_disabled() {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
 		},
 		response: LLMResponse::default(),
 	};

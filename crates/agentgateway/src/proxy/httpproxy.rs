@@ -3030,6 +3030,7 @@ async fn make_backend_call(
 								params: Default::default(),
 								prompt: Default::default(),
 								provider_state: None,
+								safeguards: None,
 							})
 						});
 					}
@@ -3989,6 +3990,7 @@ mod tests {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
 		}
 	}
 

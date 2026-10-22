@@ -2933,6 +2933,7 @@ mod tests {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
 		}
 	}
 
@@ -3055,6 +3056,7 @@ mod tests {
 				content: "hello".into(),
 			}])),
 			provider_state: None,
+			safeguards: None,
 		};
 		let mut context = LLMContext::from(request);
 		context.completion = Some(vec!["world".to_string()]);
@@ -3627,7 +3629,6 @@ mod tests {
 		assert!(exporter.finished_spans().is_empty());
 	}
 
-	#[test]
 	/// The per-TTL cache-write split reaches the span attributes exactly as
 	/// reported (Accounting tap contract `cache_write_5m/1h_tokens`); an
 	/// aggregate-only response leaves the split attributes absent — never
@@ -3635,6 +3636,7 @@ mod tests {
 	#[test]
 	fn llm_span_emits_cache_write_ttl_split_attributes() {
 		let request = llm::LLMRequest {
+			safeguards: None,
 			input_tokens: None,
 			input_format: InputFormat::Messages,
 			cache_convention: llm::CacheTokenConvention::InputExcludesCache,
@@ -3709,6 +3711,7 @@ mod tests {
 		log.llm_request = Some(request);
 		log.llm_response.store(Some(llm::LLMInfo::new(
 			llm::LLMRequest {
+				safeguards: None,
 				input_tokens: None,
 				input_format: InputFormat::Messages,
 				cache_convention: llm::CacheTokenConvention::InputExcludesCache,
@@ -3755,6 +3758,7 @@ mod tests {
 			params: llm::LLMRequestParams::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
 		};
 		let response = llm::LLMResponse {
 			input_tokens: Some(50),
@@ -3830,6 +3834,7 @@ mod tests {
 	#[test]
 	fn llm_span_uses_cache_inclusive_input_tokens_for_bedrock_converse() {
 		let request = llm::LLMRequest {
+			safeguards: None,
 			input_tokens: None,
 			input_format: InputFormat::Messages,
 			cache_convention: llm::CacheTokenConvention::InputExcludesCache,
@@ -3904,6 +3909,7 @@ mod tests {
 			params: llm::LLMRequestParams::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
 		};
 
 		let completeness = |response: llm::LLMResponse| -> Option<bool> {
@@ -3985,6 +3991,7 @@ mod tests {
 			params: llm::LLMRequestParams::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
 		};
 		let response = llm::LLMResponse {
 			input_tokens: Some(1_000_000),

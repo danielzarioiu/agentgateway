@@ -795,6 +795,7 @@ mod responses {
 				params: Default::default(),
 				prompt: None,
 				provider_state: None,
+				safeguards: None,
 			},
 			LLMResponse::default(),
 		)));
@@ -1718,6 +1719,7 @@ data: {"type":"message_stop"}
 				params: Default::default(),
 				prompt: None,
 				provider_state: None,
+				safeguards: None,
 			},
 			LLMResponse::default(),
 		)));
@@ -1753,6 +1755,7 @@ data: {"type":"message_stop"}
 				params: Default::default(),
 				prompt: None,
 				provider_state: None,
+				safeguards: None,
 			},
 			LLMResponse::default(),
 		)));

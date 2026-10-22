@@ -257,6 +257,10 @@ pub struct LLMRequest {
 	pub prompt: Option<Arc<Vec<SimpleChatCompletionMessage>>>,
 	#[serde(skip)]
 	pub provider_state: Option<ProviderState>,
+	/// Claude Code safeguards review plan, set only when this attempt classifies
+	/// the response locally (non-native leg). Never logged or serialized.
+	#[serde(skip)]
+	pub safeguards: Option<Arc<types::safeguards::SafeguardsReviewPlan>>,
 }
 
 #[derive(Debug, Clone)]

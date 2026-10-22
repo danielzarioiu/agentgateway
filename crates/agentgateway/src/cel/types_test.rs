@@ -171,6 +171,7 @@ fn llm_context_with_usage(
 		params: llm::LLMRequestParams::default(),
 		prompt: None,
 		provider_state: None,
+		safeguards: None,
 	};
 	LLMContext::from_llm_info(llm::LLMInfo::new(request, response), None)
 }

@@ -822,6 +822,7 @@ mod tests {
 				params: Default::default(),
 				prompt: None,
 				provider_state: None,
+				safeguards: None,
 			},
 			response: LLMResponse {
 				input_tokens: Some(1_000_000),
