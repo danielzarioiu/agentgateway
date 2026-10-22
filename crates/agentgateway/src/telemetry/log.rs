@@ -3834,6 +3834,7 @@ mod tests {
 	#[test]
 	fn llm_span_uses_cache_inclusive_input_tokens_for_bedrock_converse() {
 		let request = llm::LLMRequest {
+			safeguards: None,
 			input_tokens: None,
 			input_format: InputFormat::Messages,
 			cache_convention: llm::CacheTokenConvention::InputExcludesCache,
