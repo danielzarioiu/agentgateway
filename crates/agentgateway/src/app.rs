@@ -130,6 +130,11 @@ pub async fn run_with_ui_assets(
 
 	state_manager::start_self_workload_resolution(&config, stores.clone(), &ready);
 
+	// Dynamic Tool Search policy artifact (2026-10-20): bounded background
+	// refresh with last-known-good; no-op when the URL env is unset, so
+	// deployments without the artifact keep the env-only guard unchanged.
+	crate::llm::tool_search_policy::spawn_policy_refresher();
+
 	let mut xds_rx_for_task = xds_rx.clone();
 	tokio::spawn(async move {
 		// When we get the initial XDS state, unblock readiness

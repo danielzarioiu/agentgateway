@@ -40,6 +40,7 @@ pub const DEFAULT_BUFFER_LIMIT: usize = 32 * 1024 * 1024;
 pub mod catalog;
 pub mod discovery;
 pub mod policy;
+pub mod tool_search_policy;
 
 use policy::streaming_guardrails::GuardedSseBody;
 pub use types::{OutputMessage, OutputMessagePart, ToolCall};
@@ -1745,6 +1746,7 @@ impl AIProvider {
 				backend_info,
 				policies,
 				InputFormat::Completions,
+				false,
 				req,
 				parts,
 				managed_body,
@@ -1756,6 +1758,19 @@ impl AIProvider {
 			.await
 	}
 
+	/// Whether this provider class may serve native Anthropic Tool Search
+	/// (deferred tool loading) traffic. Capability, not wire format: only the
+	/// Anthropic Platform provider carries the conformance evidence the
+	/// allowlist models were verified against. Bedrock serving
+	/// Anthropic-Messages wire format is deliberately NOT enough (a Mantle
+	/// leg accepts the request but silently eager-loads deferred tools), and
+	/// generic Anthropic API compatibility is never taken as evidence of
+	/// Tool Search semantics (2026-10-20 Fireworks conformance: shapes are
+	/// tolerated but the search tool never executes).
+	pub fn provider_serves_native_tool_search(&self) -> bool {
+		matches!(self, AIProvider::Anthropic(_))
+	}
+
 	pub async fn process_messages_request(
 		&self,
 		backend_info: &crate::http::auth::BackendInfo,
@@ -1765,16 +1780,66 @@ impl AIProvider {
 		log: &mut Option<&mut RequestLog>,
 		catalog: agent_llm::model_catalog::Catalog<'_>,
 	) -> Result<RequestResult, AIError> {
-		let (parts, managed_body, mut req) = self
+		let (mut parts, managed_body, mut req) = self
 			.read_body_and_default_model::<types::messages::Request>(policies, req, log)
 			.await?;
 		self.apply_model_alias(policies, &mut req);
+		// Capability-aware Tool Search routing (2026-10-20): native Tool
+		// Search is served ONLY for runtime-verified models
+		// (AGENTGATEWAY_TOOL_SEARCH_MODELS). For every other model the
+		// client's Tool Search shapes are downgraded to ordinary
+		// upfront-tool-loading inference here — before routing, so failover
+		// stays fully available — keeping unverified models' ordinary
+		// workflows (including tool use) working instead of erroring. The
+		// downgrade rewrites the deferred-tool protocol plumbing in history
+		// (tool_reference parts, search-round blocks) into its eager
+		// equivalent; anything it cannot translate keeps the strict guard
+		// below (defense in depth).
+		let mut native_tool_search = req.uses_native_tool_search();
+		// Models without verified native support also cannot serve Anthropic
+		// built-in server tools (web_search/web_fetch/code_execution):
+		// third-party providers reject those tool types outright (Fireworks
+		// 400, 2026-10-20). Downgrade those requests too — removal with
+		// telemetry beats relying on every client's retry-and-recover.
+		//
+		// Mode resolution: env allowlist (deployment safety ceiling) ∩ the
+		// dynamic policy artifact when one is configured (background refresh,
+		// last-known-good; see tool_search_policy). `off` in the artifact
+		// forces the downgrade even for allowlisted models.
+		let has_builtin_server_tools = req.offers_builtin_server_tools();
+		let model_name = req.model.as_deref().unwrap_or_default();
+		let decision =
+			tool_search_policy::tool_search_decision(tool_search_model_allowed(model_name), model_name);
+		if !decision.allow_native && (native_tool_search || has_builtin_server_tools) {
+			let report = req.downgrade_tool_search();
+			strip_tool_search_beta_headers(&mut parts.headers);
+			// Sanitized decision telemetry (counts only, never tool names or
+			// content): distinguishes eager downgrades from native serving and
+			// quantifies the history rewrite for observability.
+			info!(
+				tool_search.decision = "downgraded-eager",
+				tool_search.decision_reason = decision.reason,
+				tool_search.policy_revision = decision.policy_revision.as_deref().unwrap_or("env-only"),
+				tool_search.removed_server_tools = report.removed_server_tools,
+				tool_search.removed_builtin_server_tools = report.removed_builtin_server_tools,
+				tool_search.stripped_defer_loading = report.stripped_defer_loading,
+				tool_search.removed_tool_references = report.removed_tool_references,
+				tool_search.removed_search_rounds = report.removed_search_rounds,
+				tool_search.hoisted_schemas = report.hoisted_schemas,
+				tool_search.hoisted_schema_conflicts = report.hoisted_schema_conflicts,
+				tool_search.translated_builtin_rounds = report.translated_builtin_rounds,
+				tool_search.neutralized_tool_choice = report.neutralized_tool_choice,
+				"tool search downgraded to eager tool loading for unverified model"
+			);
+			native_tool_search = req.uses_native_tool_search();
+		}
 
 		self
 			.process_chat_request(
 				backend_info,
 				policies,
 				InputFormat::Messages,
+				native_tool_search,
 				req,
 				parts,
 				managed_body,
@@ -1817,6 +1882,7 @@ impl AIProvider {
 				backend_info,
 				policies,
 				InputFormat::Gemini,
+				false,
 				req,
 				parts,
 				managed_body,
@@ -1909,6 +1975,7 @@ impl AIProvider {
 				backend_info,
 				policies,
 				InputFormat::Responses,
+				false,
 				req,
 				parts,
 				managed_body,
@@ -2259,6 +2326,7 @@ impl AIProvider {
 		backend_info: &crate::http::auth::BackendInfo,
 		policies: Option<&Policy>,
 		original_format: InputFormat,
+		native_tool_search: bool,
 		mut req: T,
 		mut parts: Parts,
 		mut managed_body: Body,
@@ -2276,6 +2344,30 @@ impl AIProvider {
 			.as_deref()
 			.ok_or_else(|| AIError::MissingField("model not specified".into()))?;
 		let chat_translation = self.chat_translation(original_format, request_model, catalog)?;
+		// Native Anthropic Tool Search (deferred tool loading) cannot survive a
+		// chat format conversion: the Bedrock Converse/OpenAI/Gemini conversions
+		// drop the tool_search server tool and flatten tool_reference blocks,
+		// silently turning a deferred-tool request into a plain text one. Fail
+		// closed before render, on EVERY attempt — initial selection and failover
+		// both re-enter here, so a later switch to an incompatible upstream is
+		// rejected the same way, never silently degraded.
+		if native_tool_search && chat_translation.output != ChatFormat::AnthropicMessages {
+			return Ok(RequestResult::Rejected(anthropic_toolsearch_incompatible(
+				chat_translation.output.tag(),
+			)));
+		}
+		// Capability-aware leg restriction (2026-10-20): a runtime-verified
+		// Tool Search model must be served by the provider class its
+		// conformance evidence was observed on — the Anthropic Platform.
+		// Bedrock serving Anthropic Messages wire format is NOT evidence of
+		// Tool Search semantics (observed 2026-10-20: a Mantle leg returns
+		// 200 while silently eager-loading every deferred tool), so a
+		// failover onto it is rejected explicitly instead of converted.
+		if native_tool_search && !self.provider_serves_native_tool_search() {
+			return Ok(RequestResult::Rejected(anthropic_toolsearch_incompatible(
+				"unverified-provider",
+			)));
+		}
 		let provider_format = chat_translation.provider_format();
 		let prepared = self
 			.prepare_request(
@@ -3376,6 +3468,77 @@ fn google_invalid_argument(message: &str) -> ::http::Response<Body> {
 		.header(::http::header::CONTENT_TYPE, "application/json")
 		.body(Body::from(body.to_string()))
 		.expect("failed to build gemini error response")
+}
+
+/// Terminal 400 in the Anthropic error shape for a `/v1/messages` request carrying
+/// native Tool Search (deferred tool loading) semantics that the selected upstream
+/// chat format cannot represent: converting would silently drop the `tool_search`
+/// server tool and flatten `tool_reference` blocks, degrading the request instead
+/// of executing it. Like the Gemini `alt=sse` guard, this answers directly rather
+/// than as an `AIError`, which would surface as a retryable 503 and invite SDK
+/// retry storms.
+fn anthropic_toolsearch_incompatible(upstream: &str) -> ::http::Response<Body> {
+	let body = serde_json::json!({
+		"type": "error",
+		"error": {
+			"type": "invalid_request_error",
+			"message": format!(
+				"This request uses Anthropic Tool Search (deferred tool loading), whose tool_reference semantics cannot be translated to the selected upstream format '{upstream}'. Route it to an Anthropic Messages-compatible provider; refusing rather than silently degrading the request."
+			),
+		}
+	});
+	::http::Response::builder()
+		.status(::http::StatusCode::BAD_REQUEST)
+		.header(::http::header::CONTENT_TYPE, "application/json")
+		.body(Body::from(body.to_string()))
+		.expect("failed to build anthropic error response")
+}
+
+/// Models whose native Tool Search (deferred tool loading) this gateway is
+/// authorized to serve, from the comma-separated
+/// `AGENTGATEWAY_TOOL_SEARCH_MODELS` env on the proxy deployment. The list
+/// is generated from the control-plane catalog's runtime-verified
+/// capabilities (never hand-invented) and verified against it by the
+/// publication-ledger reconciliation. Absent/empty ⇒ NO model is served
+/// native Tool Search: clients' Tool Search shapes are downgraded to ordinary
+/// upfront-tool-loading inference (`process_messages_request`), so the
+/// feature degrades gracefully instead of failing hard.
+fn tool_search_model_allowed(model: &str) -> bool {
+	let Ok(list) = std::env::var("AGENTGATEWAY_TOOL_SEARCH_MODELS") else {
+		return false;
+	};
+	list.split(',').any(|entry| entry.trim() == model)
+}
+
+/// Remove the tool-search `anthropic-beta` values from a downgraded request
+/// so the upstream never sees a Tool Search beta it is not being asked (and
+/// verified) to serve. Other beta values on the same comma-separated header
+/// survive; the header is dropped entirely when nothing else remains.
+fn strip_tool_search_beta_headers(headers: &mut ::http::HeaderMap) {
+	let values: Vec<::http::HeaderValue> =
+		headers.get_all("anthropic-beta").iter().cloned().collect();
+	if values.is_empty() {
+		return;
+	}
+	headers.remove("anthropic-beta");
+	for value in values {
+		let Ok(raw) = value.to_str() else {
+			continue;
+		};
+		let kept: Vec<&str> = raw
+			.split(',')
+			.map(str::trim)
+			.filter(|beta| !beta.is_empty())
+			.filter(|beta| {
+				!beta.starts_with("tool-search-tool") && !beta.starts_with("advanced-tool-use")
+			})
+			.collect();
+		if !kept.is_empty()
+			&& let Ok(joined) = ::http::HeaderValue::from_str(&kept.join(", "))
+		{
+			headers.append("anthropic-beta", joined);
+		}
+	}
 }
 
 /// Remove `alt` from the request query, keeping any other parameters (e.g. `key`).
