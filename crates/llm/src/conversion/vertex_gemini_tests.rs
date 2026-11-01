@@ -1658,6 +1658,7 @@ mod passthrough {
 				prompt: None,
 				provider_state: None,
 				safeguards: None,
+				transport_hints: Default::default(),
 			},
 			response: LLMResponse::default(),
 		}))

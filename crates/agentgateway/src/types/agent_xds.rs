@@ -1979,6 +1979,14 @@ pub(crate) fn backend_with_policies_from_proto(
 									},
 									_ => llm::bedrock::BedrockEndpointPreference::RuntimePreferred,
 								},
+								// Unset proto enum resolves to CONVERSE (first
+								// variant): the fail-closed default transport.
+								transport: match bedrock.transport() {
+									proto::agent::ai_backend::BedrockTransport::NativeMessages => {
+										llm::bedrock::BedrockTransport::NativeMessages
+									},
+									_ => llm::bedrock::BedrockTransport::Converse,
+								},
 							})
 						},
 						Some(provider::Provider::Azure(azure)) => {

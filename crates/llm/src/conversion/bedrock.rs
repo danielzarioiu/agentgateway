@@ -14,6 +14,14 @@ use crate::types::{bedrock, messages, responses};
 #[path = "bedrock_tests.rs"]
 mod tests;
 
+/// Native Anthropic Messages transport for Bedrock Runtime
+/// (`InvokeModel` / `InvokeModelWithResponseStream`), enabled per backend
+/// via `BedrockTransport::NativeMessages`. See the module docs for the
+/// passthrough guarantees (Tool Search shapes, exact tool names, client
+/// `cache_control` TTLs) and the accounting-hint contract.
+#[path = "bedrock_native.rs"]
+pub mod from_messages_native;
+
 /// Bedrock Converse `toolSpec.name` length limit.
 pub const BEDROCK_TOOL_NAME_MAX_LEN: usize = 64;
 
@@ -3923,6 +3931,53 @@ mod helpers {
 		headers: &http::HeaderMap,
 	) -> Result<Option<Vec<serde_json::Value>>, AIError> {
 		extract_beta_headers_with_allowed(headers, &ALLOWED_BETA_HEADERS)
+	}
+
+	/// Collect every client `anthropic-beta` value without filtering
+	/// (comma-split across repeated headers, order-preserving,
+	/// de-duplicated). Used by the native Messages transport, which forwards
+	/// the client's beta set verbatim by default.
+	pub fn extract_beta_headers_raw(headers: &http::HeaderMap) -> Vec<String> {
+		let mut out = Vec::new();
+		for value in headers.get_all("anthropic-beta") {
+			let Ok(header_str) = value.to_str() else {
+				continue;
+			};
+			for feature in header_str.split(',') {
+				let trimmed = feature.trim();
+				if !trimmed.is_empty() && !out.iter().any(|v| v == trimmed) {
+					out.push(trimmed.to_string());
+				}
+			}
+		}
+		out
+	}
+
+	/// Native-transport beta resolution: `(kept, dropped)`. Verbatim
+	/// (everything kept) unless an explicit env allow-list is configured —
+	/// unset env, or a value list containing only the `default` sentinel
+	/// (plus blanks), means "no restriction".
+	pub fn native_beta_resolution(values: Vec<String>) -> (Vec<String>, Vec<String>) {
+		let explicit = std::env::var(ALLOWED_BETA_HEADERS_ENV).is_ok_and(|v| {
+			!v.split(',')
+				.map(str::trim)
+				.all(|feature| feature.is_empty() || feature == DEFAULT_SENTINEL)
+		});
+		native_beta_resolution_with(values, explicit)
+	}
+
+	/// Pure core of [`native_beta_resolution`], injectable for tests.
+	pub fn native_beta_resolution_with(
+		values: Vec<String>,
+		explicit_allow_list: bool,
+	) -> (Vec<String>, Vec<String>) {
+		if !explicit_allow_list {
+			return (values, Vec::new());
+		}
+		let allowed = &*ALLOWED_BETA_HEADERS;
+		values
+			.into_iter()
+			.partition(|value| allowed.iter().any(|feature| feature == value))
 	}
 
 	pub fn extract_beta_headers_with_allowed(

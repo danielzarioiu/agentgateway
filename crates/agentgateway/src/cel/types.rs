@@ -1725,6 +1725,9 @@ impl From<llm::LLMRequest> for LLMContext {
 			prompt,
 			provider_state: _,
 			safeguards: _,
+			// Not exposed to CEL policies: transport hints are an internal
+			// accounting/telemetry contract, not a policy input.
+			transport_hints: _,
 		} = info;
 		LLMContext {
 			streaming,

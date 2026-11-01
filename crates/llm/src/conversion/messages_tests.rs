@@ -53,6 +53,7 @@ fn captured_info() -> Arc<Mutex<LLMInfo>> {
 			prompt: None,
 			provider_state: None,
 			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	}))

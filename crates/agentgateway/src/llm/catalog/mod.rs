@@ -823,6 +823,7 @@ mod tests {
 				prompt: None,
 				provider_state: None,
 				safeguards: None,
+				transport_hints: Default::default(),
 			},
 			response: LLMResponse {
 				input_tokens: Some(1_000_000),

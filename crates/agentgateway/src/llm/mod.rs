@@ -10,8 +10,9 @@ pub use agent_llm::tokenizer::{num_tokens_from_messages, preload_tokenizers};
 pub use agent_llm::{
 	AIError, CacheTokenConvention, ChatFormat, ContentScope, InputFormat, LLMInfo, LLMRequest,
 	LLMRequestParams, LLMResponse, LogContentFields, PromptCachingConfig, Provider, ProviderState,
-	RequestType, ResponseType, RouteType, SimpleChatCompletionMessage, TokenGapSummary, anthropic,
-	conversion, copilot, custom, gemini, logged_response_parsing, openai, types,
+	RequestType, ResponseType, RouteType, SimpleChatCompletionMessage, TokenGapSummary,
+	TransportHints, anthropic, conversion, copilot, custom, gemini, logged_response_parsing,
+	openai, types,
 };
 use axum_extra::headers::authorization::Bearer;
 use headers::{ContentEncoding, HeaderMapExt};
@@ -318,6 +319,9 @@ struct ChatTranslation {
 struct RenderedChatRequest {
 	body: Vec<u8>,
 	provider_state: Option<ProviderState>,
+	/// Request-render facts for accounting/telemetry (e.g. the Bedrock
+	/// native Messages transport flags). Empty for every other translation.
+	transport_hints: TransportHints,
 }
 
 // Context provider to each request translation
@@ -351,6 +355,12 @@ struct ChatStreamContext {
 	log_content: LogContentFields,
 	tool_name_map: Option<conversion::bedrock::BedrockToolNameMap>,
 	namespaces: Option<Arc<conversion::namespace_tools::NamespaceToolMap>>,
+	/// The upstream speaks the native Bedrock Runtime Messages transport
+	/// (`InvokeModelWithResponseStream`): the response body is the AWS
+	/// EventStream binary protocol even though the selected chat format is
+	/// AnthropicMessages, so the stream must be transcoded before the
+	/// Anthropic-native passthrough state machine sees it.
+	bedrock_native: bool,
 }
 
 /// Ordered chat conversion table.
@@ -431,6 +441,7 @@ fn render_openai_completions(
 	Ok(RenderedChatRequest {
 		body,
 		provider_state,
+		transport_hints: TransportHints::default(),
 	})
 }
 
@@ -546,6 +557,40 @@ fn render_bedrock_converse(
 	Ok(RenderedChatRequest {
 		body: bedrock.body,
 		provider_state,
+		transport_hints: TransportHints::default(),
+	})
+}
+
+/// Render the Anthropic Messages body for a Bedrock backend whose chat
+/// transport is `native-messages` (Runtime `InvokeModel`). The client body
+/// passes through natively — no Converse typed round-trip, no tool-name
+/// remapping, no cachePoint synthesis — with only the Bedrock envelope
+/// (`anthropic_version`, body-level `anthropic_beta`) added.
+fn render_bedrock_native_messages(
+	req: types::ChatRequest,
+	ctx: &ChatRequestContext<'_>,
+) -> Result<RenderedChatRequest, AIError> {
+	let AIProvider::Bedrock(provider) = ctx.provider else {
+		return Err(AIError::UnsupportedConversion(strng::literal!(
+			"expected bedrock provider"
+		)));
+	};
+	let _ = provider;
+	let native = conversion::bedrock::from_messages_native::translate(
+		req,
+		ctx.catalog,
+		Some(ctx.headers),
+	)?;
+	Ok(RenderedChatRequest {
+		body: native.body,
+		// Deliberately no ProviderState::Bedrock: the tool-name map must not
+		// exist on the native path so response/stream handling never rewrites
+		// tool names or restores them.
+		provider_state: None,
+		transport_hints: TransportHints {
+			bedrock_native_messages: true,
+			cache_1h_requested: native.cache_1h_requested,
+		},
 	})
 }
 
@@ -576,6 +621,18 @@ impl ChatTranslation {
 		let body = match self.output {
 			ChatFormat::OpenAICompletions => return render_openai_completions(req, ctx),
 			ChatFormat::OpenAIResponses => render_openai_responses(req, ctx),
+			// Bedrock native Messages transport (Runtime InvokeModel): the
+			// body is the client's Anthropic payload plus the Bedrock
+			// envelope. This arm must run BEFORE the generic passthrough —
+			// Mantle backends (same ChatFormat) keep their plain rendering.
+			ChatFormat::AnthropicMessages
+				if matches!(
+					ctx.provider,
+					AIProvider::Bedrock(b) if b.transport == bedrock::BedrockTransport::NativeMessages
+				) =>
+			{
+				return render_bedrock_native_messages(req, ctx);
+			},
 			ChatFormat::AnthropicMessages if matches!(ctx.provider, AIProvider::Vertex(_)) => {
 				vertex::prepare_anthropic_message_body(render_anthropic_messages(req, ctx.catalog)?)
 			},
@@ -585,12 +642,14 @@ impl ChatTranslation {
 				return Ok(RenderedChatRequest {
 					body: render_vertex_gemini(req, ctx)?,
 					provider_state: Some(ProviderState::VertexGemini),
+					transport_hints: TransportHints::default(),
 				});
 			},
 		}?;
 		Ok(RenderedChatRequest {
 			body,
 			provider_state: None,
+			transport_hints: TransportHints::default(),
 		})
 	}
 
@@ -717,6 +776,40 @@ impl ChatTranslation {
 					)
 				}),
 				_ => resp,
+			},
+
+			// Bedrock native Messages transport: the upstream body is the AWS
+			// EventStream binary protocol, so it is transcoded into Anthropic
+			// SSE first and then routed through the exact same per-input
+			// translations the direct Anthropic provider uses (passthrough for
+			// Messages clients, completions translation for OpenAI clients).
+			// No tool-name map exists on this path (provider_state is None).
+			ChatFormat::AnthropicMessages if ctx.bedrock_native => {
+				let resp = resp.map(|b| {
+					conversion::bedrock::from_messages_native::transcode_stream_to_sse(
+						b,
+						ctx.buffer_limit,
+					)
+				});
+				match self.input {
+					InputFormat::Messages => resp.map(|b| {
+						conversion::messages::passthrough_stream(
+							b,
+							ctx.buffer_limit,
+							ctx.logger,
+							ctx.log_content,
+						)
+					}),
+					InputFormat::Completions => resp.map(|b| {
+						conversion::messages::from_completions::translate_stream(
+							b,
+							ctx.buffer_limit,
+							ctx.logger,
+							ctx.log_content,
+						)
+					}),
+					_ => resp,
+				}
 			},
 
 			ChatFormat::AnthropicMessages => match self.input {
@@ -1769,8 +1862,20 @@ impl AIProvider {
 	/// generic Anthropic API compatibility is never taken as evidence of
 	/// Tool Search semantics (2026-10-20 Fireworks conformance: shapes are
 	/// tolerated but the search tool never executes).
+	///
+	/// Exception (2026-11-01): a Bedrock backend whose configured chat
+	/// transport is `native-messages` serves Anthropic Messages bodies
+	/// verbatim through Runtime InvokeModel — AWS documents Tool Search as
+	/// available on exactly those APIs — so it qualifies as a native-capable
+	/// provider class. Converse and Mantle legs still never qualify; the
+	/// check re-runs on every provider attempt, so a failover onto a
+	/// Converse backend is rejected the same way as before.
 	pub fn provider_serves_native_tool_search(&self) -> bool {
 		matches!(self, AIProvider::Anthropic(_))
+			|| matches!(
+				self,
+				AIProvider::Bedrock(b) if b.transport == bedrock::BedrockTransport::NativeMessages
+			)
 	}
 
 	pub async fn process_messages_request(
@@ -2472,6 +2577,7 @@ impl AIProvider {
 			},
 		)?;
 		llm_info.provider_state = rendered.provider_state;
+		llm_info.transport_hints = rendered.transport_hints;
 		llm_info.safeguards = safeguards;
 		// Couldn't find a better place to apply it, needs to be after rendered. but before generating the request.
 		let body = match policies {
@@ -3299,14 +3405,18 @@ impl AIProvider {
 			let translation = chat_translation.expect("chat translation was selected for chat input");
 			translation.stream(
 				resp,
-				ChatStreamContext {
-					buffer_limit: buffer,
-					logger,
-					model: model.to_string(),
-					log_content,
-					tool_name_map: bedrock_tool_name_map,
-					namespaces,
-				},
+			ChatStreamContext {
+				buffer_limit: buffer,
+				logger,
+				model: model.to_string(),
+				log_content,
+				tool_name_map: bedrock_tool_name_map,
+				namespaces,
+				bedrock_native: matches!(
+					self,
+					AIProvider::Bedrock(b) if b.transport == bedrock::BedrockTransport::NativeMessages
+				),
+			},
 			)
 		} else {
 			match (self, input_format) {
