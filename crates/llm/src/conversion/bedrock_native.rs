@@ -614,4 +614,315 @@ mod tests {
 		assert_eq!(response.input_tokens, Some(500));
 		assert_eq!(response.usage_complete, Some(false));
 	}
+
+	#[tokio::test]
+	async fn stream_replay_duplicate_message_delta_finalizes_once() {
+		// Bedrock/Anthropic message_delta usage is CUMULATIVE. A duplicate (or
+		// an intermediate) terminal delta must REPLACE, never add: the last
+		// cumulative value wins and settlement cannot double count.
+		let events = vec![
+			message_start(json!({"input_tokens": 900, "output_tokens": 0})),
+			json!({"type": "content_block_delta", "index": 0,
+				"delta": {"type": "text_delta", "text": "x"}}),
+			json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+				"usage": {"output_tokens": 30}}),
+			// A replayed cumulative delta carrying the final total:
+			json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+				"usage": {"output_tokens": 57}}),
+			json!({"type": "message_stop"}),
+		];
+		let info = std::sync::Arc::new(std::sync::Mutex::new(crate::LLMInfo::new(
+			crate::LLMRequest {
+				input_tokens: None,
+				input_format: crate::InputFormat::Messages,
+				cache_convention: crate::CacheTokenConvention::InputExcludesCache,
+				request_model: strng::literal!("m"),
+				provider: strng::literal!("aws.bedrock"),
+				streaming: true,
+				params: Default::default(),
+				prompt: None,
+				provider_state: None,
+				safeguards: None,
+				transport_hints: TransportHints {
+					bedrock_native_messages: true,
+					cache_1h_requested: false,
+				},
+			},
+			crate::LLMResponse::default(),
+		)));
+		let reporter = TestStreamingReporter { info: info.clone() };
+		let sse = transcode_stream_to_sse(encoded_stream(&events), 1_048_576);
+		let out = crate::conversion::messages::passthrough_stream(
+			sse,
+			1_048_576,
+			crate::StreamingUsageGuard::new(Box::new(reporter)),
+			crate::LogContentFields::default(),
+		);
+		let body = out.collect().await.unwrap().to_bytes();
+		let text = String::from_utf8(body.to_vec()).unwrap();
+		let response = &info.lock().unwrap().response;
+		// 57 (final cumulative), NOT 30 + 57 = 87.
+		assert_eq!(response.output_tokens, Some(57));
+		assert_eq!(response.input_tokens, Some(900));
+		assert_eq!(response.usage_complete, Some(true));
+		// Both deltas pass through to the client verbatim (transparent relay);
+		// exactly-once holds at the accounting layer because finalization is
+		// an overwrite of the cumulative meter, not an accumulation.
+		assert_eq!(text.matches("event: message_delta").count(), 2);
+	}
+
+	#[tokio::test]
+	async fn stream_partial_emission_then_exception_is_error_not_success() {
+		// A provider error AFTER partial emission must end the client stream
+		// with an error event, never a synthetic success: no message_stop
+		// synthesis, usage stays provisional so the attempt cannot settle as
+		// a priced zero-cost or partial success.
+		let events = vec![
+			message_start(json!({"input_tokens": 700, "output_tokens": 0})),
+			json!({"type": "content_block_delta", "index": 0,
+				"delta": {"type": "text_delta", "text": "partial"}}),
+		];
+		let info = std::sync::Arc::new(std::sync::Mutex::new(crate::LLMInfo::new(
+			crate::LLMRequest {
+				input_tokens: None,
+				input_format: crate::InputFormat::Messages,
+				cache_convention: crate::CacheTokenConvention::InputExcludesCache,
+				request_model: strng::literal!("m"),
+				provider: strng::literal!("aws.bedrock"),
+				streaming: true,
+				params: Default::default(),
+				prompt: None,
+				provider_state: None,
+				safeguards: None,
+				transport_hints: TransportHints {
+					bedrock_native_messages: true,
+					cache_1h_requested: false,
+				},
+			},
+			crate::LLMResponse::default(),
+		)));
+		let reporter = TestStreamingReporter { info: info.clone() };
+		// Partial events followed by an in-stream exception frame.
+		use aws_smithy_eventstream::frame::write_message_to;
+		let mut buf = bytes::BytesMut::new();
+		for event in &events {
+			let message = parse::aws_sse::Message::new(Bytes::from(event.to_string()));
+			write_message_to(&message, &mut buf).expect("frame encodes");
+		}
+		let exception_headers: Vec<aws_smithy_types::event_stream::Header> = [
+			(":message-type", "exception"),
+			(":exception-type", "ModelStreamErrorException"),
+		]
+		.iter()
+		.map(|(name, value)| {
+			aws_smithy_types::event_stream::Header::new(
+				name.to_string(),
+				aws_smithy_types::event_stream::HeaderValue::String(value.to_string().into()),
+			)
+		})
+		.collect();
+		let exception = parse::aws_sse::Message::new_from_parts(
+			exception_headers,
+			Bytes::from_static(b"model stream error"),
+		);
+		write_message_to(&exception, &mut buf).expect("frame encodes");
+		let sse = transcode_stream_to_sse(agent_http::Body::from(buf.freeze()), 1_048_576);
+		let out = crate::conversion::messages::passthrough_stream(
+			sse,
+			1_048_576,
+			crate::StreamingUsageGuard::new(Box::new(reporter)),
+			crate::LogContentFields::default(),
+		);
+		let body = out.collect().await.unwrap().to_bytes();
+		let text = String::from_utf8(body.to_vec()).unwrap();
+		assert!(text.contains("event: error"), "SSE: {text}");
+		assert!(!text.contains("event: message_stop"), "SSE: {text}");
+		let response = &info.lock().unwrap().response;
+		// Partial evidence retained, terminal usage never fabricated.
+		assert_eq!(response.input_tokens, Some(700));
+		assert_ne!(response.usage_complete, Some(true));
+	}
+
+	#[tokio::test]
+	async fn stream_truncated_midway_keeps_partial_meters_provisional() {
+		// Client disconnect / timeout shape: the upstream ends (or is cut)
+		// after partial emission. Whatever meters were already observed stay
+		// recorded and attributable (provisional), nothing is fabricated.
+		let events = vec![
+			message_start(json!({
+				"input_tokens": 500, "output_tokens": 0,
+				"cache_read_input_tokens": 200, "cache_creation_input_tokens": 0,
+			})),
+			json!({"type": "content_block_delta", "index": 0,
+				"delta": {"type": "text_delta", "text": "cut"}}),
+		];
+		let info = std::sync::Arc::new(std::sync::Mutex::new(crate::LLMInfo::new(
+			crate::LLMRequest {
+				input_tokens: None,
+				input_format: crate::InputFormat::Messages,
+				cache_convention: crate::CacheTokenConvention::InputExcludesCache,
+				request_model: strng::literal!("m"),
+				provider: strng::literal!("aws.bedrock"),
+				streaming: true,
+				params: Default::default(),
+				prompt: None,
+				provider_state: None,
+				safeguards: None,
+				transport_hints: TransportHints {
+					bedrock_native_messages: true,
+					cache_1h_requested: false,
+				},
+			},
+			crate::LLMResponse::default(),
+		)));
+		let reporter = TestStreamingReporter { info: info.clone() };
+		let sse = transcode_stream_to_sse(encoded_stream(&events), 1_048_576);
+		let out = crate::conversion::messages::passthrough_stream(
+			sse,
+			1_048_576,
+			crate::StreamingUsageGuard::new(Box::new(reporter)),
+			crate::LogContentFields::default(),
+		);
+		let _ = out.collect().await.unwrap();
+		let response = &info.lock().unwrap().response;
+		assert_eq!(response.input_tokens, Some(500));
+		assert_eq!(response.cached_input_tokens, Some(200));
+		assert_ne!(response.usage_complete, Some(true));
+	}
+
+	#[test]
+	fn tool_search_multi_turn_round_trip_preserves_everything() {
+		// A full Tool Search conversation: turn 1's assistant reply contains
+		// the server_tool_use block, turn 2's user message carries the
+		// tool_search_tool_result with nested tool_reference entries, and the
+		// history includes thinking blocks. NONE of these shapes may be
+		// rewritten, dropped, or remapped on the native leg.
+		let body = json!({
+			"model": "claude-sonnet-5-5",
+			"max_tokens": 2048,
+			"tools": [
+				{"type": "tool_search_tool_regex", "name": "tool_search_tool_regex"},
+				{"name": "get_weather", "description": "weather lookup",
+				 "input_schema": {"type": "object", "properties": {}}}
+			],
+			"messages": [
+				{"role": "user", "content": "find a weather tool"},
+				{"role": "assistant", "content": [
+					{"type": "thinking", "thinking": "need to discover the tool first",
+					 "signature": "sig-abc"},
+					{"type": "server_tool_use", "id": "srvtoolu_01",
+					 "name": "tool_search_tool_regex",
+					 "input": {"pattern": "weather", "limit": 3}}
+				]},
+				{"role": "user", "content": [
+					{"type": "tool_result", "tool_use_id": "srvtoolu_01", "content": [
+						{"type": "tool_reference", "tool_name": "get_weather"},
+						{"type": "text", "text": "discovered get_weather"}
+					]}
+				]},
+				{"role": "assistant", "content": [
+					{"type": "thinking", "thinking": "now call it", "signature": "sig-def"},
+					{"type": "tool_use", "id": "toolu_02", "name": "get_weather",
+					 "input": {"location": "Rome"}}
+				]},
+				{"role": "user", "content": [
+					{"type": "tool_result", "tool_use_id": "toolu_02", "content": "sunny"}
+				]}
+			]
+		});
+		let (out, native) = translate_body(body, None).expect("multi-turn translate");
+		assert_eq!(out["anthropic_version"], "bedrock-2023-05-31");
+		// Turn 1 server_tool_use survives verbatim (name AND input).
+		let t1 = &out["messages"][1]["content"];
+		assert_eq!(t1[1]["type"], "server_tool_use");
+		assert_eq!(t1[1]["name"], "tool_search_tool_regex");
+		assert_eq!(t1[1]["input"]["pattern"], "weather");
+		// Turn 2 tool_search_tool_result with nested tool_reference survives.
+		let t2 = &out["messages"][2]["content"][0];
+		assert_eq!(t2["tool_use_id"], "srvtoolu_01");
+		assert_eq!(t2["content"][0]["type"], "tool_reference");
+		assert_eq!(t2["content"][0]["tool_name"], "get_weather");
+		// Thinking blocks with signatures survive byte-exact.
+		assert_eq!(out["messages"][1]["content"][0]["signature"], "sig-abc");
+		assert_eq!(out["messages"][3]["content"][0]["thinking"], "now call it");
+		// Ordinary tool_use/tool_result round-trip unaffected.
+		assert_eq!(out["messages"][3]["content"][1]["name"], "get_weather");
+		assert_eq!(out["messages"][4]["content"][0]["content"], "sunny");
+		assert!(!native.cache_1h_requested);
+	}
+
+	#[tokio::test]
+	async fn stream_replay_reconstructs_server_tool_response_verbatim() {
+		// The provider's response stream for a Tool Search turn carries
+		// server_tool_use / tool_search_tool_result content blocks; the
+		// client-facing SSE must reconstruct them byte-exactly and finalize
+		// usage once.
+		let events = vec![
+			message_start(json!({"input_tokens": 1500, "output_tokens": 0,
+				"cache_read_input_tokens": 0, "cache_creation_input_tokens": 0})),
+			json!({"type": "content_block_start", "index": 0,
+				"content_block": {"type": "thinking", "thinking": ""}}),
+			json!({"type": "content_block_delta", "index": 0,
+				"delta": {"type": "thinking_delta", "thinking": "search first"}}),
+			json!({"type": "content_block_stop", "index": 0}),
+			json!({"type": "content_block_start", "index": 1,
+				"content_block": {"type": "server_tool_use", "id": "srvtoolu_9",
+					"name": "tool_search_tool_regex", "input": {}}}),
+			json!({"type": "content_block_delta", "index": 1,
+				"delta": {"type": "input_json_delta", "partial_json": "{\"pattern\":\"weather\"}"}}),
+			json!({"type": "content_block_stop", "index": 1}),
+			json!({"type": "content_block_start", "index": 2,
+				"content_block": {"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_9",
+					"content": []}}),
+			json!({"type": "content_block_stop", "index": 2}),
+			json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"},
+				"usage": {"output_tokens": 88}}),
+			json!({"type": "message_stop"}),
+		];
+		let info = std::sync::Arc::new(std::sync::Mutex::new(crate::LLMInfo::new(
+			crate::LLMRequest {
+				input_tokens: None,
+				input_format: crate::InputFormat::Messages,
+				cache_convention: crate::CacheTokenConvention::InputExcludesCache,
+				request_model: strng::literal!("claude-sonnet-5-5"),
+				provider: strng::literal!("aws.bedrock"),
+				streaming: true,
+				params: Default::default(),
+				prompt: None,
+				provider_state: None,
+				safeguards: None,
+				transport_hints: TransportHints {
+					bedrock_native_messages: true,
+					cache_1h_requested: false,
+				},
+			},
+			crate::LLMResponse::default(),
+		)));
+		let reporter = TestStreamingReporter { info: info.clone() };
+		let sse = transcode_stream_to_sse(encoded_stream(&events), 1_048_576);
+		let out = crate::conversion::messages::passthrough_stream(
+			sse,
+			1_048_576,
+			crate::StreamingUsageGuard::new(Box::new(reporter)),
+			crate::LogContentFields::default(),
+		);
+		let body = out.collect().await.unwrap().to_bytes();
+		let text = String::from_utf8(body.to_vec()).unwrap();
+		assert!(text.contains("\"type\":\"server_tool_use\""), "SSE: {text}");
+		assert!(
+			text.contains("\"type\":\"tool_search_tool_result\""),
+			"SSE: {text}"
+		);
+		// partial_json is JSON-escaped inside the SSE payload — match the
+		// escaped form exactly (byte-exact reconstruction, not a re-encode).
+		assert!(
+			text.contains("\\\"pattern\\\":\\\"weather\\\""),
+			"SSE: {text}"
+		);
+		assert!(text.contains("\"type\":\"thinking_delta\""), "SSE: {text}");
+		let response = &info.lock().unwrap().response;
+		assert_eq!(response.input_tokens, Some(1500));
+		assert_eq!(response.output_tokens, Some(88));
+		assert_eq!(response.usage_complete, Some(true));
+	}
 }
