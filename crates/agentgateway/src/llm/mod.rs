@@ -11,8 +11,8 @@ pub use agent_llm::{
 	AIError, CacheTokenConvention, ChatFormat, ContentScope, InputFormat, LLMInfo, LLMRequest,
 	LLMRequestParams, LLMResponse, LogContentFields, PromptCachingConfig, Provider, ProviderState,
 	RequestType, ResponseType, RouteType, SimpleChatCompletionMessage, TokenGapSummary,
-	TransportHints, anthropic, conversion, copilot, custom, gemini, logged_response_parsing,
-	openai, types,
+	TransportHints, anthropic, conversion, copilot, custom, gemini, logged_response_parsing, openai,
+	types,
 };
 use axum_extra::headers::authorization::Bearer;
 use headers::{ContentEncoding, HeaderMapExt};
@@ -576,11 +576,8 @@ fn render_bedrock_native_messages(
 		)));
 	};
 	let _ = provider;
-	let native = conversion::bedrock::from_messages_native::translate(
-		req,
-		ctx.catalog,
-		Some(ctx.headers),
-	)?;
+	let native =
+		conversion::bedrock::from_messages_native::translate(req, ctx.catalog, Some(ctx.headers))?;
 	Ok(RenderedChatRequest {
 		body: native.body,
 		// Deliberately no ProviderState::Bedrock: the tool-name map must not
@@ -786,10 +783,7 @@ impl ChatTranslation {
 			// No tool-name map exists on this path (provider_state is None).
 			ChatFormat::AnthropicMessages if ctx.bedrock_native => {
 				let resp = resp.map(|b| {
-					conversion::bedrock::from_messages_native::transcode_stream_to_sse(
-						b,
-						ctx.buffer_limit,
-					)
+					conversion::bedrock::from_messages_native::transcode_stream_to_sse(b, ctx.buffer_limit)
 				});
 				match self.input {
 					InputFormat::Messages => resp.map(|b| {
@@ -3405,18 +3399,18 @@ impl AIProvider {
 			let translation = chat_translation.expect("chat translation was selected for chat input");
 			translation.stream(
 				resp,
-			ChatStreamContext {
-				buffer_limit: buffer,
-				logger,
-				model: model.to_string(),
-				log_content,
-				tool_name_map: bedrock_tool_name_map,
-				namespaces,
-				bedrock_native: matches!(
-					self,
-					AIProvider::Bedrock(b) if b.transport == bedrock::BedrockTransport::NativeMessages
-				),
-			},
+				ChatStreamContext {
+					buffer_limit: buffer,
+					logger,
+					model: model.to_string(),
+					log_content,
+					tool_name_map: bedrock_tool_name_map,
+					namespaces,
+					bedrock_native: matches!(
+						self,
+						AIProvider::Bedrock(b) if b.transport == bedrock::BedrockTransport::NativeMessages
+					),
+				},
 			)
 		} else {
 			match (self, input_format) {

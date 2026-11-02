@@ -28,7 +28,7 @@ use serde::de::DeserializeOwned;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use tracing::{Level, debug, trace};
+use tracing::{Level, debug, trace, warn};
 use value_bag::visit::Visit;
 
 use crate::cel::{ContextBuilder, Expression, LLMContext};
@@ -966,6 +966,12 @@ impl DropOnLog {
 						response_model = ?llm_response.response_model,
 						"no model cost: model found but has no rates"
 					),
+					CostLookupStatus::Partial1hFallback => warn!(
+						provider = %llm_response.provider,
+						request_model = %llm_response.request_model,
+						response_model = ?llm_response.response_model,
+						"cost status partial: 1h cache writes priced at the 5m fallback rate — catalog card has no 1h rate; total is NOT a definitive 1h price"
+					),
 					CostLookupStatus::Exact | CostLookupStatus::NoCatalog => {},
 				}
 			}
@@ -1882,8 +1888,7 @@ impl Drop for DropOnLog {
 							.bedrock_native_messages
 							.then_some(ValueBag::from("native-messages"))
 							.or_else(|| {
-								(l.provider.as_str() == "aws.bedrock")
-									.then_some(ValueBag::from("converse"))
+								(l.provider.as_str() == "aws.bedrock").then_some(ValueBag::from("converse"))
 							})
 					}),
 				),
@@ -1934,10 +1939,7 @@ impl Drop for DropOnLog {
 					"gen_ai.usage.cache_creation.input_tokens.1h",
 					llm_response.as_ref().and_then(|l| {
 						l.cache_creation_1h_input_tokens
-							.or_else(|| {
-								provable_5m_write_split(log.llm_request.as_ref(), l)
-									.then_some(0)
-							})
+							.or_else(|| provable_5m_write_split(log.llm_request.as_ref(), l).then_some(0))
 							.map(Into::into)
 					}),
 				),
@@ -3335,18 +3337,18 @@ mod tests {
 				for has_response in [false, true] {
 					let (mut log, registry) = test_request_log_with_registry();
 					let mut request = llm::LLMRequest {
-			input_tokens: None,
-			input_format: llm::InputFormat::Messages,
-			cache_convention: llm::CacheTokenConvention::InputExcludesCache,
-			request_model: "test-model".into(),
-			provider: "aws.bedrock".into(),
-			streaming: true,
-			params: Default::default(),
-			prompt: None,
-			provider_state: None,
-			safeguards: None,
-			transport_hints: llm::TransportHints::default(),
-		};
+						input_tokens: None,
+						input_format: llm::InputFormat::Messages,
+						cache_convention: llm::CacheTokenConvention::InputExcludesCache,
+						request_model: "test-model".into(),
+						provider: "aws.bedrock".into(),
+						streaming: true,
+						params: Default::default(),
+						prompt: None,
+						provider_state: None,
+						safeguards: None,
+						transport_hints: llm::TransportHints::default(),
+					};
 					request.input_format = format;
 					request.streaming = streaming;
 					log.llm_request = Some(request.clone());

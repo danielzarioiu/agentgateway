@@ -617,7 +617,11 @@ mod tests {
 		] {
 			let p = native_provider(pref);
 			assert_eq!(
-				p.resolve_endpoint(RouteType::Messages, Some("global.anthropic.claude-opus-5-5"), None),
+				p.resolve_endpoint(
+					RouteType::Messages,
+					Some("global.anthropic.claude-opus-5-5"),
+					None
+				),
 				BedrockEndpoint::Runtime,
 				"native transport must stay on Runtime under {pref:?}"
 			);
@@ -634,28 +638,41 @@ mod tests {
 		let p = native_provider(BedrockEndpointPreference::RuntimePreferred);
 		let ep = BedrockEndpoint::Runtime;
 		assert_eq!(
-			p.get_path_for_route(RouteType::Messages, false, "global.anthropic.claude-opus-5-5", ep)
-				.as_str(),
+			p.get_path_for_route(
+				RouteType::Messages,
+				false,
+				"global.anthropic.claude-opus-5-5",
+				ep
+			)
+			.as_str(),
 			"/model/global.anthropic.claude-opus-5-5/invoke"
 		);
 		assert_eq!(
-			p.get_path_for_route(RouteType::Messages, true, "global.anthropic.claude-opus-5-5", ep)
-				.as_str(),
+			p.get_path_for_route(
+				RouteType::Messages,
+				true,
+				"global.anthropic.claude-opus-5-5",
+				ep
+			)
+			.as_str(),
 			"/model/global.anthropic.claude-opus-5-5/invoke-with-response-stream"
 		);
 		// Non-Messages routes keep the historical Converse paths: Responses
 		// input falls back to Converse translation, and embeddings/token-count
 		// keep their dedicated APIs.
 		assert_eq!(
-			p.get_path_for_route(RouteType::Responses, true, "m", ep).as_str(),
+			p.get_path_for_route(RouteType::Responses, true, "m", ep)
+				.as_str(),
 			"/model/m/converse-stream"
 		);
 		assert_eq!(
-			p.get_path_for_route(RouteType::Completions, false, "m", ep).as_str(),
+			p.get_path_for_route(RouteType::Completions, false, "m", ep)
+				.as_str(),
 			"/model/m/converse"
 		);
 		assert_eq!(
-			p.get_path_for_route(RouteType::Embeddings, false, "m", ep).as_str(),
+			p.get_path_for_route(RouteType::Embeddings, false, "m", ep)
+				.as_str(),
 			"/model/m/invoke"
 		);
 		assert_eq!(
@@ -672,11 +689,13 @@ mod tests {
 		let p = provider(BedrockEndpointPreference::RuntimePreferred);
 		let ep = BedrockEndpoint::Runtime;
 		assert_eq!(
-			p.get_path_for_route(RouteType::Messages, false, "m", ep).as_str(),
+			p.get_path_for_route(RouteType::Messages, false, "m", ep)
+				.as_str(),
 			"/model/m/converse"
 		);
 		assert_eq!(
-			p.get_path_for_route(RouteType::Messages, true, "m", ep).as_str(),
+			p.get_path_for_route(RouteType::Messages, true, "m", ep)
+				.as_str(),
 			"/model/m/converse-stream"
 		);
 		assert_eq!(
@@ -698,13 +717,12 @@ mod tests {
 		// how BedrockEndpointPreference serializes; the K8s CRD surface
 		// exposes the PascalCase "NativeMessages" via the controller types
 		// and the telemetry attribute uses the kebab "native-messages".
-		let native: Provider = serde_json::from_str(
-			r#"{"region":"eu-west-1","transport":"nativeMessages"}"#,
-		)
-		.expect("nativeMessages config must deserialize");
+		let native: Provider =
+			serde_json::from_str(r#"{"region":"eu-west-1","transport":"nativeMessages"}"#)
+				.expect("nativeMessages config must deserialize");
 		assert_eq!(native.transport, BedrockTransport::NativeMessages);
-		let implicit: Provider = serde_json::from_str(r#"{"region":"eu-west-1"}"#)
-			.expect("missing transport must default");
+		let implicit: Provider =
+			serde_json::from_str(r#"{"region":"eu-west-1"}"#).expect("missing transport must default");
 		assert_eq!(implicit.transport, BedrockTransport::Converse);
 		// Wire-name assertions (telemetry attribute contract).
 		assert_eq!(BedrockTransport::Converse.as_str(), "converse");

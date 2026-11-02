@@ -4934,14 +4934,12 @@ fn bedrock_native_transport_qualifies_for_tool_search_guard() {
 
 	// Converse and (implicitly) Mantle legs never qualify: failover from a
 	// native backend onto them must keep hitting the strict guard.
-	assert!(!bedrock(bedrock::BedrockTransport::Converse)
-		.provider_serves_native_tool_search());
+	assert!(!bedrock(bedrock::BedrockTransport::Converse).provider_serves_native_tool_search());
 
 	// A native-messages backend qualifies — Runtime InvokeModel is the AWS
 	// documented Tool Search surface — so genuine Tool Search shapes are
 	// served, not rejected.
-	assert!(bedrock(bedrock::BedrockTransport::NativeMessages)
-		.provider_serves_native_tool_search());
+	assert!(bedrock(bedrock::BedrockTransport::NativeMessages).provider_serves_native_tool_search());
 }
 
 #[test]
@@ -4961,7 +4959,11 @@ fn bedrock_native_transport_serves_messages_format_on_runtime() {
 	// Messages input rides the native passthrough translation.
 	assert_eq!(
 		native
-			.chat_translation(InputFormat::Messages, "global.anthropic.claude-opus-5-5", None)
+			.chat_translation(
+				InputFormat::Messages,
+				"global.anthropic.claude-opus-5-5",
+				None
+			)
 			.unwrap()
 			.output,
 		ChatFormat::AnthropicMessages
@@ -4970,7 +4972,11 @@ fn bedrock_native_transport_serves_messages_format_on_runtime() {
 	// conversion exists; failing closed to the proven translation).
 	assert_eq!(
 		native
-			.chat_translation(InputFormat::Responses, "global.anthropic.claude-opus-5-5", None)
+			.chat_translation(
+				InputFormat::Responses,
+				"global.anthropic.claude-opus-5-5",
+				None
+			)
 			.unwrap()
 			.output,
 		ChatFormat::BedrockConverse

@@ -329,7 +329,7 @@ mod requests {
 				guardrail_identifier: None,
 				guardrail_version: None,
 				endpoint_preference: Default::default(),
-			transport: Default::default(),
+				transport: Default::default(),
 			};
 			test_request(
 				provider,

@@ -108,7 +108,8 @@ impl Request {
 					!tool_type.starts_with("tool_search")
 				}
 			});
-			report.removed_server_tools = server_tools - tools.len() - report.removed_builtin_server_tools;
+			report.removed_server_tools =
+				server_tools - tools.len() - report.removed_builtin_server_tools;
 		}
 
 		let mut hoisted: Vec<serde_json::Value> = Vec::new();
@@ -160,7 +161,8 @@ impl Request {
 					.iter()
 					.enumerate()
 					.filter_map(|(index, tool)| {
-						tool.get("name")
+						tool
+							.get("name")
 							.and_then(|n| n.as_str())
 							.map(|n| (n.to_string(), index, Origin::Declared))
 					})
@@ -267,7 +269,9 @@ fn is_builtin_server_tool(tool_type: &str) -> bool {
 /// field of a history `server_tool_use` block (the block names the tool
 /// without its version suffix, e.g. `web_search`).
 fn is_builtin_server_tool_name(name: &str) -> bool {
-	name.starts_with("web_search") || name.starts_with("web_fetch") || name.starts_with("code_execution")
+	name.starts_with("web_search")
+		|| name.starts_with("web_fetch")
+		|| name.starts_with("code_execution")
 }
 
 /// History result blocks of the built-in server tools (`web_search_tool_result`,
@@ -348,12 +352,14 @@ impl Request {
 	/// shapes at all, so TS detection alone would forward the unsupported
 	/// tool and leave the failure to the upstream.
 	pub fn offers_builtin_server_tools(&self) -> bool {
-		self.rest
+		self
+			.rest
 			.get("tools")
 			.and_then(|t| t.as_array())
 			.is_some_and(|items| {
 				items.iter().any(|tool| {
-					tool.get("type")
+					tool
+						.get("type")
 						.and_then(serde_json::Value::as_str)
 						.is_some_and(is_builtin_server_tool)
 				})
@@ -2482,7 +2488,8 @@ mod tests {
 			.collect();
 		let mut tools = deferred.clone();
 		tools.extend(eager.clone());
-		tools.push(serde_json::json!({"type": "tool_search_tool_regex_20250922", "name": "tool_search"}));
+		tools
+			.push(serde_json::json!({"type": "tool_search_tool_regex_20250922", "name": "tool_search"}));
 
 		let body = serde_json::json!({
 			"model": "glm-5p3",
@@ -2524,9 +2531,8 @@ mod tests {
 			})
 			.collect();
 		expected.extend(eager);
-		let by_name = |v: &serde_json::Value| {
-			v.get("name").and_then(|n| n.as_str()).unwrap().to_string()
-		};
+		let by_name =
+			|v: &serde_json::Value| v.get("name").and_then(|n| n.as_str()).unwrap().to_string();
 		let mut out_sorted = out_tools.clone();
 		out_sorted.sort_by_key(by_name);
 		let mut expected_sorted = expected;
@@ -2576,7 +2582,10 @@ mod tests {
 		assert!(!req.uses_native_tool_search());
 		let report = req.downgrade_tool_search();
 		assert_eq!(report.removed_builtin_server_tools, 2);
-		assert_eq!(report.removed_server_tools, 0, "tool_search family is separate");
+		assert_eq!(
+			report.removed_server_tools, 0,
+			"tool_search family is separate"
+		);
 		let serialized = serde_json::to_value(&req).unwrap();
 		let tools = serialized["tools"].as_array().unwrap();
 		assert_eq!(tools.len(), 1, "ordinary tool stays: {serialized}");
@@ -2759,8 +2768,7 @@ mod tests {
 		let serialized = serde_json::to_value(&req).unwrap();
 		let history = serialized.to_string();
 		assert!(
-			!history.contains("\"server_tool_use\"")
-				&& !history.contains("\"web_search_tool_result\""),
+			!history.contains("\"server_tool_use\"") && !history.contains("\"web_search_tool_result\""),
 			"no executable-looking server tool blocks may survive (the neutral text marker may name what it replaced): {serialized}"
 		);
 		assert!(

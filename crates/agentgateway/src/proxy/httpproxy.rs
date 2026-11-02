@@ -3019,21 +3019,21 @@ async fn make_backend_call(
 							.find(|(k, _v)| k == "model")
 							.map(|(_, v)| strng::new(v))
 							.unwrap_or_default();
-							log.add(|l| {
-								l.llm_request = Some(LLMRequest {
-									input_format: InputFormat::Realtime,
-									cache_convention: llm::CacheTokenConvention::pending(),
-									request_model,
-									streaming: true,
-									provider: llm.provider.provider(),
-									input_tokens: None,
-									params: Default::default(),
-									prompt: Default::default(),
-									provider_state: None,
-									safeguards: None,
-									transport_hints: Default::default(),
-								})
-							});
+						log.add(|l| {
+							l.llm_request = Some(LLMRequest {
+								input_format: InputFormat::Realtime,
+								cache_convention: llm::CacheTokenConvention::pending(),
+								request_model,
+								streaming: true,
+								provider: llm.provider.provider(),
+								input_tokens: None,
+								params: Default::default(),
+								prompt: Default::default(),
+								provider_state: None,
+								safeguards: None,
+								transport_hints: Default::default(),
+							})
+						});
 					}
 					(req, LLMResponsePolicies::default(), None)
 				},

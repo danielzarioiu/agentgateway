@@ -88,10 +88,7 @@ pub fn translate(
 		if tool_search_request
 			&& let Some(required) = dropped
 				.iter()
-				.find(|beta| {
-					beta.starts_with("tool-search-tool")
-						|| beta.starts_with("advanced-tool-use")
-				})
+				.find(|beta| beta.starts_with("tool-search-tool") || beta.starts_with("advanced-tool-use"))
 				.map(|beta| beta.clone())
 		{
 			return Err(AIError::UnsupportedConversion(strng::format!(
@@ -149,8 +146,7 @@ fn native_stream_frame(m: parse::aws_sse::Message) -> Vec<(String, Bytes)> {
 	};
 
 	if get_header(":message-type").as_deref() == Some("exception") {
-		let exception_type =
-			get_header(":exception-type").unwrap_or_else(|| "unknown".to_owned());
+		let exception_type = get_header(":exception-type").unwrap_or_else(|| "unknown".to_owned());
 		let error_message = String::from_utf8_lossy(m.payload());
 		let body = json!({
 			"type": "error",
@@ -176,7 +172,10 @@ fn native_stream_frame(m: parse::aws_sse::Message) -> Vec<(String, Bytes)> {
 		let v: serde_json::Value = serde_json::from_slice(payload).ok()?;
 		// 1. LIVE wire shape: :event-type "chunk" + {"bytes": "<base64>"}.
 		if let Some(encoded) = v.get("bytes").and_then(|b| b.as_str()) {
-			return base64::engine::general_purpose::STANDARD.decode(encoded).ok().map(Bytes::from);
+			return base64::engine::general_purpose::STANDARD
+				.decode(encoded)
+				.ok()
+				.map(Bytes::from);
 		}
 		// 2. Doc/SDK shape (defensive): {"chunk": {"bytes": "<base64>"}}.
 		if let Some(encoded) = v
@@ -184,7 +183,10 @@ fn native_stream_frame(m: parse::aws_sse::Message) -> Vec<(String, Bytes)> {
 			.and_then(|chunk| chunk.get("bytes"))
 			.and_then(|b| b.as_str())
 		{
-			return base64::engine::general_purpose::STANDARD.decode(encoded).ok().map(Bytes::from);
+			return base64::engine::general_purpose::STANDARD
+				.decode(encoded)
+				.ok()
+				.map(Bytes::from);
 		}
 		// 3. Direct Anthropic event (defensive): top-level `type`.
 		if v.get("type").and_then(|t| t.as_str()).is_some() {
@@ -208,7 +210,11 @@ fn native_stream_frame(m: parse::aws_sse::Message) -> Vec<(String, Bytes)> {
 
 	let name = serde_json::from_slice::<serde_json::Value>(&event)
 		.ok()
-		.and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|s| s.to_string()))
+		.and_then(|v| {
+			v.get("type")
+				.and_then(|t| t.as_str())
+				.map(|s| s.to_string())
+		})
 		.unwrap_or_default();
 	vec![(name, event)]
 }
@@ -257,17 +263,18 @@ fn body_uses_native_tool_search(body: &serde_json::Value) -> bool {
 			_ => {},
 		}
 	});
-	found || body
-		.get("tools")
-		.and_then(|tools| tools.as_array())
-		.is_some_and(|tools| {
-			tools.iter().any(|tool| {
-				tool
-					.get("type")
-					.and_then(|t| t.as_str())
-					.is_some_and(|ty| ty.starts_with("tool_search"))
+	found
+		|| body
+			.get("tools")
+			.and_then(|tools| tools.as_array())
+			.is_some_and(|tools| {
+				tools.iter().any(|tool| {
+					tool
+						.get("type")
+						.and_then(|t| t.as_str())
+						.is_some_and(|ty| ty.starts_with("tool_search"))
+				})
 			})
-		})
 }
 
 /// Depth-first walk over every JSON object in the value.
@@ -291,12 +298,12 @@ fn walk_json(value: &serde_json::Value, f: &mut impl FnMut(&serde_json::Value)) 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use base64::Engine as _;
-	use http_body_util::BodyExt;
 	use crate::TransportHints;
 	use crate::conversion::bedrock::helpers;
 	use crate::types::messages;
+	use base64::Engine as _;
 	use http::HeaderMap;
+	use http_body_util::BodyExt;
 	use serde_json::json;
 
 	fn native_request_from(body: serde_json::Value) -> types::ChatRequest {
@@ -363,7 +370,9 @@ mod tests {
 		let mut headers = HeaderMap::new();
 		headers.insert(
 			"anthropic-beta",
-			"claude-code-20250219, tool-search-tool-2025-10-19".parse().unwrap(),
+			"claude-code-20250219, tool-search-tool-2025-10-19"
+				.parse()
+				.unwrap(),
 		);
 		headers.append("anthropic-beta", "effort-2025-11-24".parse().unwrap());
 		let (out, _) = translate_body(
@@ -377,7 +386,14 @@ mod tests {
 			.iter()
 			.map(|v| v.as_str().expect("string beta"))
 			.collect();
-		assert_eq!(betas, vec!["claude-code-20250219", "tool-search-tool-2025-10-19", "effort-2025-11-24"]);
+		assert_eq!(
+			betas,
+			vec![
+				"claude-code-20250219",
+				"tool-search-tool-2025-10-19",
+				"effort-2025-11-24"
+			]
+		);
 	}
 
 	#[test]
@@ -396,7 +412,10 @@ mod tests {
 		// Tool Search betas: a Tool Search request must be REJECTED, never
 		// silently degraded.
 		let mut headers = HeaderMap::new();
-		headers.insert("anthropic-beta", "advanced-tool-use-2025-11-20".parse().unwrap());
+		headers.insert(
+			"anthropic-beta",
+			"advanced-tool-use-2025-11-20".parse().unwrap(),
+		);
 		let body = json!({
 			"model": "m", "max_tokens": 1,
 			"tools": [{"name": "t", "input_schema": {"type": "object"}, "defer_loading": true}],
@@ -406,13 +425,14 @@ mod tests {
 		});
 		let native = translate(native_request_from(body), None, Some(&headers))
 			.expect("translate reaches beta resolution");
-		let raw = helpers::extract_beta_headers_raw(
-			&{
-				let mut h = HeaderMap::new();
-				h.insert("anthropic-beta", "advanced-tool-use-2025-11-20".parse().unwrap());
-				h
-			},
-		);
+		let raw = helpers::extract_beta_headers_raw(&{
+			let mut h = HeaderMap::new();
+			h.insert(
+				"anthropic-beta",
+				"advanced-tool-use-2025-11-20".parse().unwrap(),
+			);
+			h
+		});
 		let (kept, dropped) = helpers::native_beta_resolution_with(raw, true);
 		assert!(kept.is_empty() && !dropped.is_empty());
 		let _ = native; // request-level shape validated above
@@ -457,7 +477,10 @@ mod tests {
 		let hv: Vec<Header> = headers
 			.into_iter()
 			.map(|(name, value)| {
-				Header::new(name.to_string(), HeaderValue::String(value.to_string().into()))
+				Header::new(
+					name.to_string(),
+					HeaderValue::String(value.to_string().into()),
+				)
 			})
 			.collect();
 		parse::aws_sse::Message::new_from_parts(hv, payload)
@@ -471,8 +494,11 @@ mod tests {
 		let encoded = base64::engine::general_purpose::STANDARD.encode(event.to_string());
 		let payload = json!({"bytes": encoded}).to_string();
 		let out = native_stream_frame(frame(
-			vec![(":message-type", "event"), (":event-type", "chunk"),
-				(":content-type", "application/json")],
+			vec![
+				(":message-type", "event"),
+				(":event-type", "chunk"),
+				(":content-type", "application/json"),
+			],
 			Bytes::from(payload),
 		));
 		assert_eq!(out.len(), 1);
@@ -526,26 +552,33 @@ mod tests {
 		assert_eq!(out.len(), 1);
 		assert_eq!(out[0].0, "error");
 		let parsed: serde_json::Value = serde_json::from_slice(&out[0].1).unwrap();
-		assert!(parsed["error"]["message"]
-			.as_str()
-			.unwrap()
-			.contains("futureEvent"));
+		assert!(
+			parsed["error"]["message"]
+				.as_str()
+				.unwrap()
+				.contains("futureEvent")
+		);
 	}
 
 	#[test]
 	fn stream_frame_surfaces_exception_as_error_event() {
 		let out = native_stream_frame(frame(
-			vec![(":message-type", "exception"), (":exception-type", "ThrottlingException")],
+			vec![
+				(":message-type", "exception"),
+				(":exception-type", "ThrottlingException"),
+			],
 			Bytes::from_static(b"rate exceeded"),
 		));
 		assert_eq!(out.len(), 1);
 		assert_eq!(out[0].0, "error");
 		let parsed: serde_json::Value = serde_json::from_slice(&out[0].1).unwrap();
 		assert_eq!(parsed["type"], "error");
-		assert!(parsed["error"]["message"]
-			.as_str()
-			.unwrap()
-			.starts_with("ThrottlingException:"));
+		assert!(
+			parsed["error"]["message"]
+				.as_str()
+				.unwrap()
+				.starts_with("ThrottlingException:")
+		);
 	}
 
 	#[test]
