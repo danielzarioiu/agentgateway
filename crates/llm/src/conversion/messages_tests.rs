@@ -14,9 +14,15 @@
 //! zero-token-but-complete provider attempt for every such stream — the
 //! exact production defect signature (succeeded attempts with
 //! input=output=cache_read=cache_write=0 and usage_complete=true).
+//!
+//! The placeholder is ALL-ZERO only: Anthropic `input_tokens` excludes
+//! cached tokens, so a fully cached `message_start` (0/0 with positive
+//! cache-read/creation) is real billing evidence and must survive even
+//! when the final `message_delta` does not repeat the cache dimensions.
 
 use std::sync::{Arc, Mutex};
 
+use agent_http::Body;
 use http_body_util::BodyExt;
 
 use super::passthrough_stream;
@@ -46,6 +52,8 @@ fn captured_info() -> Arc<Mutex<LLMInfo>> {
 			params: Default::default(),
 			prompt: None,
 			provider_state: None,
+			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	}))
@@ -112,6 +120,11 @@ async fn passthrough_stream_final_usage_overrides_message_start_placeholder() {
 	);
 	assert_eq!(info.response.cache_creation_input_tokens, Some(0));
 	assert_eq!(
+		info.response.usage_complete,
+		Some(true),
+		"message_delta usage is cumulative-final"
+	);
+	assert_eq!(
 		info.response.provider_model.as_deref(),
 		Some("accounts/fireworks/models/kimi-k3")
 	);
@@ -138,6 +151,319 @@ async fn passthrough_stream_message_delta_without_usage_leaves_no_zero_fabricati
 		"message_start placeholder zeros must not become final usage evidence"
 	);
 	assert_eq!(info.response.output_tokens, None);
+	assert_eq!(
+		info.response.usage_complete, None,
+		"no usage evidence at all: completeness stays untracked, not falsely final"
+	);
+}
+
+/// The terminal `message_delta` usage may carry the Anthropic
+/// `usage.cache_creation` split object. The telemetry evidence must carry
+/// the per-TTL classes exactly as reported — including an explicit
+/// `Some(0)` bucket, which is real split evidence, not absence — and the
+/// client-facing passthrough wire stays byte-identical (json_passthrough).
+#[tokio::test]
+async fn passthrough_stream_message_delta_carries_ttl_split() {
+	let input = format!(
+		"{}\n\n{}\n\n",
+		message_start_with_usage(
+			r#"{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}"#
+		),
+		r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":67769,"output_tokens":44,"cache_creation_input_tokens":67759,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":67759,"ephemeral_1h_input_tokens":0}}}"#,
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.cache_creation_input_tokens, Some(67759));
+	assert_eq!(
+		info.response.cache_creation_5m_input_tokens,
+		Some(67759),
+		"5m bucket is explicit split evidence"
+	);
+	assert_eq!(
+		info.response.cache_creation_1h_input_tokens,
+		Some(0),
+		"a reported 1h zero is evidence of absence, not unknown"
+	);
+	assert_eq!(info.response.usage_complete, Some(true));
+}
+
+/// Aggregate-only streams (older providers, `cache_creation` absent) must
+/// keep the split unknown — never zero-fabricated — so downstream
+/// accounting keeps failing closed on ambiguous aggregates.
+#[tokio::test]
+async fn passthrough_stream_aggregate_only_keeps_ttl_split_unknown() {
+	let input = format!(
+		"{}\n\n{}\n\n",
+		message_start_with_usage(
+			r#"{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}"#
+		),
+		r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":91,"output_tokens":16,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.cache_creation_input_tokens, Some(0));
+	assert_eq!(info.response.cache_creation_5m_input_tokens, None);
+	assert_eq!(info.response.cache_creation_1h_input_tokens, None);
+}
+
+fn message_start_with_usage(usage_json: &str) -> String {
+	format!(
+		r#"data: {{"type":"message_start","message":{{"id":"msg_c","type":"message","role":"assistant","model":"accounts/fireworks/models/kimi-k3","content":[],"stop_reason":null,"stop_sequence":null,"usage":{usage_json}}}}}"#,
+	)
+}
+
+/// Anthropic `input_tokens` EXCLUDES cached tokens, so a fully cached
+/// request legitimately reports `input_tokens: 0` / `output_tokens: 0` with
+/// a positive `cache_read_input_tokens`. That is real billing evidence —
+/// NOT a placeholder — and must survive even when no `message_delta`
+/// follows. The provider-reported zeros become evidence only because they
+/// come with cache counts, unlike the all-zero case above.
+#[tokio::test]
+async fn passthrough_stream_fully_cached_message_start_keeps_cache_read_evidence() {
+	let input = format!(
+		"{}\n\n{}\n\n",
+		message_start_with_usage(
+			r#"{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":2048}"#
+		),
+		r#"data: {"type":"message_stop"}"#
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(
+		info.response.cached_input_tokens,
+		Some(2048),
+		"cache-read tokens are billing evidence even with 0/0 input/output"
+	);
+	assert_eq!(info.response.cache_creation_input_tokens, Some(0));
+	assert_eq!(info.response.input_tokens, Some(0));
+	assert_eq!(info.response.output_tokens, Some(0));
+	assert_eq!(
+		info.response.usage_complete,
+		Some(false),
+		"real evidence observed, but no cumulative update arrived"
+	);
+}
+
+/// REPRODUCTION of the v1.6.0 field report: `message_start` carries
+/// legitimate non-zero provisional usage (input=27, output=1 — native
+/// Anthropic reports the prompt count plus a provisional output count of 1
+/// here), content streams, and the final cumulative `message_delta` usage
+/// never arrives because the stream does not terminate cleanly. The
+/// provisional counts are real observations and must be preserved, but the
+/// gateway currently records nothing that distinguishes this state from a
+/// complete stream — downstream accounting cannot tell final from
+/// provisional.
+#[tokio::test]
+async fn passthrough_stream_nonzero_provisional_usage_without_final_update() {
+	let input = format!(
+		"{}\n\n{}\n\n{}\n\n{}\n\n",
+		message_start_with_usage(r#"{"input_tokens":27,"output_tokens":1}"#),
+		r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+		r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"provisional"}}"#,
+		r#"data: {"type":"message_stop"}"#
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.input_tokens, Some(27));
+	assert_eq!(info.response.output_tokens, Some(1));
+	// The provider billed at least the prompt; the observed counts are
+	// retained, and `usage_complete = Some(false)` marks them provisional
+	// so accounting consumers never mistake them for invoice-authoritative
+	// totals.
+	assert_eq!(info.response.usage_complete, Some(false));
+}
+
+/// Same fully-cached shape, but the prompt WROTE a new cache entry
+/// (`cache_creation_input_tokens` only, cache-read absent).
+#[tokio::test]
+async fn passthrough_stream_fully_cached_message_start_keeps_cache_creation_evidence() {
+	let input = format!(
+		"{}\n\n{}\n\n",
+		message_start_with_usage(
+			r#"{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":512}"#
+		),
+		r#"data: {"type":"message_stop"}"#
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.cache_creation_input_tokens, Some(512));
+	assert_eq!(
+		info.response.cached_input_tokens, None,
+		"absent cache-read stays unknown, not zero"
+	);
+	assert_eq!(info.response.input_tokens, Some(0));
+	assert_eq!(info.response.output_tokens, Some(0));
+	assert_eq!(info.response.usage_complete, Some(false));
+}
+
+/// A `message_delta` that reports only the token counts and does NOT repeat
+/// the cache dimensions must not wipe the `message_start` cache evidence.
+#[tokio::test]
+async fn passthrough_stream_delta_without_cache_fields_keeps_message_start_cache() {
+	let input = format!(
+		"{}\n\n{}\n\n{}\n\n{}\n\n",
+		message_start_with_usage(
+			r#"{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":2048}"#
+		),
+		r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+		r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":8,"output_tokens":20}}"#,
+		r#"data: {"type":"message_stop"}"#
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.input_tokens, Some(8), "delta override wins");
+	assert_eq!(info.response.output_tokens, Some(20));
+	assert_eq!(
+		info.response.cached_input_tokens,
+		Some(2048),
+		"cache evidence from message_start must survive a cache-less delta"
+	);
+	assert_eq!(info.response.total_tokens, Some(28));
+	assert_eq!(info.response.usage_complete, Some(true));
+}
+
+/// A `message_start` with regular non-zero token usage and no later
+/// `message_delta` remains direct usage evidence (unchanged behavior).
+#[tokio::test]
+async fn passthrough_stream_nonzero_message_start_usage_is_evidence() {
+	let input = format!(
+		"{}\n\n{}\n\n",
+		message_start_with_usage(r#"{"input_tokens":91,"output_tokens":1}"#),
+		r#"data: {"type":"message_stop"}"#
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.input_tokens, Some(91));
+	assert_eq!(info.response.output_tokens, Some(1));
+	assert_eq!(info.response.usage_complete, Some(false));
+}
+
+/// The field report WITH its happy ending: the provisional 27/1 counts are
+/// replaced by the terminal `message_delta` cumulative usage (output grew
+/// 1 → 403), and the completeness flag flips to final.
+#[tokio::test]
+async fn passthrough_stream_final_usage_replaces_provisional_counts() {
+	let input = format!(
+		"{}\n\n{}\n\n{}\n\n{}\n\n",
+		message_start_with_usage(r#"{"input_tokens":27,"output_tokens":1}"#),
+		r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+		r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":27,"output_tokens":403}}"#,
+		r#"data: {"type":"message_stop"}"#
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.input_tokens, Some(27));
+	assert_eq!(info.response.output_tokens, Some(403));
+	assert_eq!(info.response.total_tokens, Some(430));
+	assert_eq!(
+		info.response.usage_complete,
+		Some(true),
+		"the terminal cumulative update finalizes the provisional counts"
+	);
+}
+
+/// Buffered responses carry the FINAL usage of a complete body by
+/// construction: the completeness contract holds without any stream state.
+#[test]
+fn buffered_response_usage_is_complete() {
+	use crate::types::ResponseType;
+	use crate::types::messages::typed::MessagesResponse;
+
+	let body: MessagesResponse = serde_json::from_str(
+		r#"{"id":"msg_b","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":27,"output_tokens":403,"cache_read_input_tokens":10}}"#,
+	)
+	.expect("valid messages response");
+	let resp = body.to_llm_response(LogContentFields::USAGE_ONLY);
+	assert_eq!(resp.input_tokens, Some(27));
+	assert_eq!(resp.output_tokens, Some(403));
+	assert_eq!(resp.usage_complete, Some(true));
+}
+
+/// Drive the Messages→completions streaming translation (the cross-format
+/// path an OpenAI client sees with an Anthropic Messages upstream) and
+/// return both the captured telemetry info and the client-visible bytes.
+async fn run_translate(input: String) -> (LLMInfo, Vec<u8>) {
+	let captured = captured_info();
+	let out = super::from_completions::translate_stream(
+		Body::from(input.into_bytes()),
+		1024 * 1024,
+		StreamingUsageGuard::new(Box::new(Capture(captured.clone()))),
+		LogContentFields {
+			completion: true,
+			tool_calls: false,
+		},
+	)
+	.collect()
+	.await
+	.expect("collect stream")
+	.to_bytes();
+	(captured.lock().unwrap().clone(), out.to_vec())
+}
+
+/// Fully-cached `message_start` on the translation path: the cache
+/// dimension is telemetry evidence, and — unchanged behavior — the client
+/// stream carries no usage chunk because none arrived via `message_delta`.
+#[tokio::test]
+async fn translate_stream_fully_cached_message_start_keeps_cache_evidence() {
+	let input = format!(
+		"{}\n\n{}\n\n{}\n\n{}\n\n",
+		message_start_with_usage(
+			r#"{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":2048}"#
+		),
+		r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+		r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+		r#"data: {"type":"message_stop"}"#
+	);
+	let (info, out) = run_translate(input).await;
+	assert_eq!(info.response.cached_input_tokens, Some(2048));
+	assert_eq!(info.response.input_tokens, Some(0));
+	assert_eq!(info.response.output_tokens, Some(0));
+	assert_eq!(
+		info.response.usage_complete,
+		Some(false),
+		"translation path: message_start evidence without message_delta is provisional"
+	);
+	assert!(
+		!String::from_utf8_lossy(&out).contains("prompt_tokens"),
+		"no usage chunk is synthesized for the client without a message_delta"
+	);
+}
+
+/// Translation path, `message_delta` without cache fields: the client's
+/// final usage chunk must be built from the `message_start` cache evidence
+/// (completions `prompt_tokens` includes cache tokens by convention) and
+/// the telemetry keeps both sources.
+#[tokio::test]
+async fn translate_stream_delta_without_cache_fields_builds_cache_aware_usage() {
+	let input = format!(
+		"{}\n\n{}\n\n{}\n\n{}\n\n{}\n\n",
+		message_start_with_usage(
+			r#"{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":2048}"#
+		),
+		r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+		r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+		r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":8,"output_tokens":20}}"#,
+		r#"data: {"type":"message_stop"}"#
+	);
+	let (info, out) = run_translate(input).await;
+	assert_eq!(info.response.input_tokens, Some(8));
+	assert_eq!(info.response.output_tokens, Some(20));
+	assert_eq!(info.response.cached_input_tokens, Some(2048));
+	assert_eq!(info.response.total_tokens, Some(28));
+	assert_eq!(
+		info.response.usage_complete,
+		Some(true),
+		"translation path: message_delta usage is cumulative-final"
+	);
+
+	let out_str = String::from_utf8_lossy(&out).into_owned();
+	let usage_chunk = out_str
+		.lines()
+		.map(|l| l.trim_start_matches("data: "))
+		.find(|l| l.contains("prompt_tokens"))
+		.expect("final usage chunk");
+	let v: serde_json::Value = serde_json::from_str(usage_chunk).expect("usage chunk json");
+	let usage = v.get("usage").expect("usage field");
+	assert_eq!(
+		usage["prompt_tokens"],
+		8 + 2048,
+		"prompt_tokens includes cache-read"
+	);
+	assert_eq!(usage["completion_tokens"], 20);
+	assert_eq!(usage["total_tokens"], 8 + 2048 + 20);
+	assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 2048);
 }
 
 /// Prompt-caching wire shape: real non-zero cache_read/cache_creation counts
@@ -158,11 +484,53 @@ async fn passthrough_stream_cache_usage_is_preserved() {
 	assert_eq!(info.response.input_tokens, Some(200));
 	assert_eq!(info.response.output_tokens, Some(32));
 	assert_eq!(
-		info.response.cached_input_tokens, Some(512),
+		info.response.cached_input_tokens,
+		Some(512),
 		"cache_read evidence must survive extraction"
 	);
 	assert_eq!(
-		info.response.cache_creation_input_tokens, Some(128),
+		info.response.cache_creation_input_tokens,
+		Some(128),
 		"cache_creation evidence must survive extraction"
 	);
+}
+
+/// Captured production `message_start` shape (golden stream_basic): a
+/// small aggregate alongside an all-zero split — the provider's
+/// authoritative sub-minimum no-op write evidence. The split buckets are
+/// forwarded EXACTLY as reported (Some(0)/Some(0) — real evidence, not
+/// absence) and the terminal delta, which carries no split here, leaves
+/// that evidence untouched instead of clobbering it.
+#[tokio::test]
+async fn passthrough_stream_sub_minimum_zero_split_is_authoritative_evidence() {
+	let input = format!(
+		"{}\n\n{}\n\n",
+		message_start_with_usage(
+			r#"{"input_tokens":15,"output_tokens":1,"cache_creation_input_tokens":13,"cache_read_input_tokens":12,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}"#
+		),
+		r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":21}}"#,
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.cache_creation_input_tokens, Some(13));
+	assert_eq!(info.response.cache_creation_5m_input_tokens, Some(0));
+	assert_eq!(info.response.cache_creation_1h_input_tokens, Some(0));
+}
+
+/// Real Anthropic streaming shape (production canary): the input-side
+/// usage is final at `message_start` and SELF-CONSISTENT
+/// (aggregate == 5m + 1h), while the terminal delta carries no split. The
+/// consistent split becomes evidence at start and survives the delta.
+#[tokio::test]
+async fn passthrough_stream_consistent_message_start_split_becomes_evidence() {
+	let input = format!(
+		"{}\n\n{}\n\n",
+		message_start_with_usage(
+			r#"{"input_tokens":10,"output_tokens":1,"cache_creation_input_tokens":67759,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":67759,"ephemeral_1h_input_tokens":0}}"#
+		),
+		r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":44}}"#,
+	);
+	let info = run_passthrough(input).await;
+	assert_eq!(info.response.cache_creation_input_tokens, Some(67759));
+	assert_eq!(info.response.cache_creation_5m_input_tokens, Some(67759));
+	assert_eq!(info.response.cache_creation_1h_input_tokens, Some(0));
 }
