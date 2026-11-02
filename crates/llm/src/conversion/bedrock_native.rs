@@ -123,11 +123,20 @@ pub fn transcode_stream_to_sse(b: Body, buffer_limit: usize) -> Body {
 /// Decode one `InvokeModelWithResponseStream` EventStream frame into
 /// `(event-name, payload)` pairs for the client-facing SSE stream.
 ///
-/// Documented wire shape (AWS): a `chunk` PayloadPart whose `bytes` member
-/// is the base64-encoded Anthropic event JSON. A direct Anthropic event
-/// object with a `type` discriminator is also accepted defensively;
-/// anything else surfaces as an explicit `error` SSE event so bytes are
-/// never dropped silently and usage stays honestly unresolved.
+/// LIVE-WIRE SHAPE (verified on Stage 2026-11-01 against real Bedrock
+/// InvokeModelWithResponseStream traffic): the AWS EventStream union-member
+/// name travels in the `:event-type` HEADER and the frame payload holds ONLY
+/// the member's fields — a chunk frame is `:event-type: chunk` with payload
+/// `{"bytes": "<base64 Anthropic event JSON>"}` (the `PayloadPart` shape, no
+/// `chunk` wrapper), and the stream ends with an `:event-type: metadata`
+/// metrics frame whose payload carries no Anthropic `type`. The SDK-docs
+/// `{"chunk": {"bytes": ...}}` nesting is the SERIALIZED union shape, not the
+/// wire shape; the first streaming window failed on exactly that confusion
+/// and this decoder + its fixtures were corrected from live evidence.
+///
+/// Defensive fallbacks are kept for the doc-shaped and direct-JSON encodings;
+/// anything else surfaces as an explicit `error` SSE event so bytes are never
+/// dropped silently and usage stays honestly unresolved.
 fn native_stream_frame(m: parse::aws_sse::Message) -> Vec<(String, Bytes)> {
 	use base64::Engine as _;
 
@@ -153,23 +162,35 @@ fn native_stream_frame(m: parse::aws_sse::Message) -> Vec<(String, Bytes)> {
 		return vec![("error".to_string(), Bytes::from(body.to_string()))];
 	}
 
+	// Stream-terminating metrics frame (":event-type: metadata"): carries
+	// invocation latency/metrics, no Anthropic event and no usage — dropped
+	// here so it never reaches the client stream as a spurious trailing
+	// error after message_stop.
+	if get_header(":event-type").as_deref() == Some("metadata") {
+		return vec![];
+	}
+
+	let event_type = get_header(":event-type");
 	let payload = m.payload();
 	let event: Option<Bytes> = (|| {
 		let v: serde_json::Value = serde_json::from_slice(payload).ok()?;
+		// 1. LIVE wire shape: :event-type "chunk" + {"bytes": "<base64>"}.
+		if let Some(encoded) = v.get("bytes").and_then(|b| b.as_str()) {
+			return base64::engine::general_purpose::STANDARD.decode(encoded).ok().map(Bytes::from);
+		}
+		// 2. Doc/SDK shape (defensive): {"chunk": {"bytes": "<base64>"}}.
 		if let Some(encoded) = v
 			.get("chunk")
 			.and_then(|chunk| chunk.get("bytes"))
 			.and_then(|b| b.as_str())
 		{
-			base64::engine::general_purpose::STANDARD
-				.decode(encoded)
-				.ok()
-				.map(Bytes::from)
-		} else if v.get("type").and_then(|t| t.as_str()).is_some() {
-			Some(Bytes::copy_from_slice(payload))
-		} else {
-			None
+			return base64::engine::general_purpose::STANDARD.decode(encoded).ok().map(Bytes::from);
 		}
+		// 3. Direct Anthropic event (defensive): top-level `type`.
+		if v.get("type").and_then(|t| t.as_str()).is_some() {
+			return Some(Bytes::copy_from_slice(payload));
+		}
+		None
 	})();
 
 	let Some(event) = event else {
@@ -177,7 +198,9 @@ fn native_stream_frame(m: parse::aws_sse::Message) -> Vec<(String, Bytes)> {
 			"type": "error",
 			"error": {
 				"type": "api_error",
-				"message": "unrecognized InvokeModelWithResponseStream frame",
+				"message": format!(
+					"unrecognized InvokeModelWithResponseStream frame (event-type: {})",
+					event_type.as_deref().unwrap_or("<none>")),
 			},
 		});
 		return vec![("error".to_string(), Bytes::from(body.to_string()))];
@@ -441,7 +464,25 @@ mod tests {
 	}
 
 	#[test]
-	fn stream_frame_decodes_chunk_base64_shape() {
+	fn stream_frame_decodes_live_chunk_wire_shape() {
+		// LIVE-PROVEN shape (Stage 2026-11-01): :event-type "chunk" header +
+		// payload {"bytes": "<base64>"} — no "chunk" wrapper on the wire.
+		let event = json!({"type": "message_start", "message": {"id": "msg_1"}});
+		let encoded = base64::engine::general_purpose::STANDARD.encode(event.to_string());
+		let payload = json!({"bytes": encoded}).to_string();
+		let out = native_stream_frame(frame(
+			vec![(":message-type", "event"), (":event-type", "chunk"),
+				(":content-type", "application/json")],
+			Bytes::from(payload),
+		));
+		assert_eq!(out.len(), 1);
+		assert_eq!(out[0].0, "message_start");
+		assert_eq!(out[0].1.as_ref(), event.to_string().as_bytes());
+	}
+
+	#[test]
+	fn stream_frame_decodes_chunk_base64_doc_shape() {
+		// Defensive fallback: the SDK-docs serialized union shape.
 		let event = json!({"type": "message_start", "message": {"id": "msg_1"}});
 		let encoded = base64::engine::general_purpose::STANDARD.encode(event.to_string());
 		let payload = json!({"chunk": {"bytes": encoded}}).to_string();
@@ -459,6 +500,36 @@ mod tests {
 		assert_eq!(out.len(), 1);
 		assert_eq!(out[0].0, "content_block_delta");
 		assert_eq!(out[0].1.as_ref(), event.to_string().as_bytes());
+	}
+
+	#[test]
+	fn stream_frame_drops_metadata_metrics_frame() {
+		// The stream-terminating metadata frame carries invocation metrics and
+		// NO Anthropic type — it must be dropped, not surfaced as a trailing
+		// client error after message_stop.
+		let payload = json!({"metrics": {"invocationLatencyMs": 1574}}).to_string();
+		let out = native_stream_frame(frame(
+			vec![(":message-type", "event"), (":event-type", "metadata")],
+			Bytes::from(payload),
+		));
+		assert!(out.is_empty());
+	}
+
+	#[test]
+	fn stream_frame_unknown_event_type_names_the_type() {
+		// Diagnostic improvement born live: the error names the event-type
+		// header value so the next window can classify an unknown frame.
+		let out = native_stream_frame(frame(
+			vec![(":message-type", "event"), (":event-type", "futureEvent")],
+			Bytes::from_static(b"{\"whatever\":true}"),
+		));
+		assert_eq!(out.len(), 1);
+		assert_eq!(out[0].0, "error");
+		let parsed: serde_json::Value = serde_json::from_slice(&out[0].1).unwrap();
+		assert!(parsed["error"]["message"]
+			.as_str()
+			.unwrap()
+			.contains("futureEvent"));
 	}
 
 	#[test]
