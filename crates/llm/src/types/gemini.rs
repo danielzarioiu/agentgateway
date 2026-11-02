@@ -246,6 +246,7 @@ impl RequestType for Request {
 			prompt: Default::default(),
 			provider_state: None,
 			safeguards: None,
+			transport_hints: Default::default(),
 		})
 	}
 
@@ -403,6 +404,7 @@ impl RequestType for CountTokensRequest {
 			prompt: Default::default(),
 			provider_state: None,
 			safeguards: None,
+			transport_hints: Default::default(),
 		})
 	}
 

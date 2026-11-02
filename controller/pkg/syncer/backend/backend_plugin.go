@@ -573,6 +573,12 @@ func translateLLMProvider(ctx plugins.PolicyCtx, namespace string, llm *agentgat
 			endpointPreference = api.AIBackend_BEDROCK_ENDPOINT_PREFERENCE_RUNTIME_ONLY
 		}
 
+		// Unset resolves to CONVERSE: the fail-closed default transport.
+		transport := api.AIBackend_BEDROCK_TRANSPORT_CONVERSE
+		if llm.Bedrock.Transport == agentgateway.BedrockTransportNativeMessages {
+			transport = api.AIBackend_BEDROCK_TRANSPORT_NATIVE_MESSAGES
+		}
+
 		provider.Provider = &api.AIBackend_Provider_Bedrock{
 			Bedrock: &api.AIBackend_Bedrock{
 				Model:               llm.Bedrock.Model,
@@ -580,6 +586,7 @@ func translateLLMProvider(ctx plugins.PolicyCtx, namespace string, llm *agentgat
 				GuardrailIdentifier: guardrailIdentifier,
 				GuardrailVersion:    guardrailVersion,
 				EndpointPreference:  endpointPreference,
+				Transport:           transport,
 			},
 		}
 	} else if llm.Custom != nil {

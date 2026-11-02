@@ -172,6 +172,7 @@ fn llm_context_with_usage(
 		prompt: None,
 		provider_state: None,
 		safeguards: None,
+		transport_hints: Default::default(),
 	};
 	LLMContext::from_llm_info(llm::LLMInfo::new(request, response), None)
 }

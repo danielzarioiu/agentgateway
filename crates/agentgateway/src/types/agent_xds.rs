@@ -1979,6 +1979,14 @@ pub(crate) fn backend_with_policies_from_proto(
 									},
 									_ => llm::bedrock::BedrockEndpointPreference::RuntimePreferred,
 								},
+								// Unset proto enum resolves to CONVERSE (first
+								// variant): the fail-closed default transport.
+								transport: match bedrock.transport() {
+									proto::agent::ai_backend::BedrockTransport::NativeMessages => {
+										llm::bedrock::BedrockTransport::NativeMessages
+									},
+									_ => llm::bedrock::BedrockTransport::Converse,
+								},
 							})
 						},
 						Some(provider::Provider::Azure(azure)) => {
@@ -6360,6 +6368,48 @@ mod tests {
 		assert_eq!(
 			spiffe.verify_sans,
 			vec!["spiffe://example.org/ns/default/sa/upstream".to_string()]
+		);
+	}
+
+	/// Decodes the exact xDS Backend bytes the Go controller emits for a
+	/// native-messages Bedrock backend (controller pkg/syncer/backend
+	/// TestBedrockTransportXdsWireFixture owns this fixture) and proves the
+	/// proxy's proto→internal conversion carries the native transport through.
+	/// This is the deterministic controller→proto→xDS→proxy fixture.
+	#[test]
+	fn bedrock_native_transport_xds_wire_fixture() {
+		use base64::Engine;
+		use prost::Message;
+
+		let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+			.join("tests/common/testdata/bedrock_native_backend.base64");
+		let raw = std::fs::read_to_string(&path).expect("xDS wire fixture should exist");
+		let bytes = base64::engine::general_purpose::STANDARD
+			.decode(raw.trim())
+			.expect("fixture should be valid base64");
+		let backend = proto::agent::Backend::decode(bytes.as_slice())
+			.expect("fixture should decode as agentgateway.dev.resource.Backend");
+
+		let converted = backend_with_policies_from_proto(&backend, &mut Diagnostics::default())
+			.expect("backend should convert");
+		let Backend::AI(_, ai) = converted.backend else {
+			panic!("expected an AI backend");
+		};
+		let mut found_native = false;
+		ai.providers.any(|p: &crate::llm::NamedAIProvider| {
+			if let crate::llm::AIProvider::Bedrock(b) = &p.provider {
+				assert_eq!(
+					b.provider.transport,
+					crate::llm::bedrock::BedrockTransport::NativeMessages
+				);
+				assert_eq!(b.provider.region, strng::new("eu-west-1"));
+				found_native = true;
+			}
+			found_native
+		});
+		assert!(
+			found_native,
+			"fixture must contain a Bedrock provider with native transport"
 		);
 	}
 }

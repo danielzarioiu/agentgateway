@@ -279,6 +279,7 @@ mod requests {
 			guardrail_identifier: None,
 			guardrail_version: None,
 			endpoint_preference: Default::default(),
+			transport: Default::default(),
 		};
 		for (name, providers) in COMPLETION_REQUESTS {
 			let path = format!("requests/completions/{name}.json");
@@ -328,6 +329,7 @@ mod requests {
 				guardrail_identifier: None,
 				guardrail_version: None,
 				endpoint_preference: Default::default(),
+			transport: Default::default(),
 			};
 			test_request(
 				provider,
@@ -350,6 +352,7 @@ mod requests {
 			guardrail_identifier: None,
 			guardrail_version: None,
 			endpoint_preference: Default::default(),
+			transport: Default::default(),
 		};
 		let vertex = vertex::Provider {
 			model_override: Some(strng::new("anthropic/claude-sonnet-4-5")),
@@ -390,6 +393,7 @@ mod requests {
 			guardrail_identifier: None,
 			guardrail_version: None,
 			endpoint_preference: Default::default(),
+			transport: Default::default(),
 		};
 		for (name, providers) in RESPONSES_REQUESTS {
 			let path = format!("requests/responses/{name}.json");
@@ -473,6 +477,7 @@ mod requests {
 			guardrail_identifier: None,
 			guardrail_version: None,
 			endpoint_preference: Default::default(),
+			transport: Default::default(),
 		};
 		let vertex = vertex::Provider {
 			model_override: Some(strng::new("semantic-ranker-default@latest")),
@@ -796,6 +801,7 @@ mod responses {
 				prompt: None,
 				provider_state: None,
 				safeguards: None,
+				transport_hints: Default::default(),
 			},
 			LLMResponse::default(),
 		)));
@@ -1050,6 +1056,7 @@ mod responses {
 			guardrail_identifier: None,
 			guardrail_version: None,
 			endpoint_preference: Default::default(),
+			transport: Default::default(),
 		};
 		let bedrock =
 			conversion::bedrock::from_responses::translate(&request, &provider, None, None, None)
@@ -1720,6 +1727,7 @@ data: {"type":"message_stop"}
 				prompt: None,
 				provider_state: None,
 				safeguards: None,
+				transport_hints: Default::default(),
 			},
 			LLMResponse::default(),
 		)));
@@ -1756,6 +1764,7 @@ data: {"type":"message_stop"}
 				prompt: None,
 				provider_state: None,
 				safeguards: None,
+				transport_hints: Default::default(),
 			},
 			LLMResponse::default(),
 		)));

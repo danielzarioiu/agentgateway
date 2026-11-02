@@ -115,6 +115,7 @@ impl RequestType for Request {
 			prompt: Default::default(),
 			provider_state: None,
 			safeguards: None,
+			transport_hints: Default::default(),
 		})
 	}
 
@@ -210,6 +211,7 @@ mod tests {
 			prompt: None,
 			provider_state: None,
 			safeguards: None,
+			transport_hints: Default::default(),
 		}
 	}
 

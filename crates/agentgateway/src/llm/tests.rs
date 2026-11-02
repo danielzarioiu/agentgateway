@@ -76,6 +76,7 @@ fn llm_request_with_tokens(input_tokens: Option<u64>) -> LLMRequest {
 		prompt: None,
 		provider_state: None,
 		safeguards: None,
+		transport_hints: Default::default(),
 	}
 }
 
@@ -115,6 +116,7 @@ fn bedrock_chat_translation_follows_endpoint_selection() {
 			guardrail_identifier: None,
 			guardrail_version: None,
 			endpoint_preference: pref,
+			transport: bedrock::BedrockTransport::Converse,
 		}))
 	}
 
@@ -201,6 +203,7 @@ async fn bedrock_chat_cache_convention_follows_upstream_format() {
 			guardrail_identifier: None,
 			guardrail_version: None,
 			endpoint_preference: bedrock::BedrockEndpointPreference::MantleOnly,
+			transport: Default::default(),
 		}));
 		let body = if input == InputFormat::Responses {
 			json!({"model": model, "input": "hello"})
@@ -246,6 +249,7 @@ fn bedrock_mantle_never_sends_completions_to_a_claude_model() {
 			guardrail_identifier: None,
 			guardrail_version: None,
 			endpoint_preference: bedrock::BedrockEndpointPreference::MantleOnly,
+			transport: Default::default(),
 		}))
 	}
 	let mantle = mantle_provider();
@@ -1642,6 +1646,7 @@ fn gemini_count_tokens_response_reports_total_tokens() {
 		prompt: None,
 		provider_state: None,
 		safeguards: None,
+		transport_hints: Default::default(),
 	};
 	let body = br#"{"totalTokens":31,"promptTokensDetails":[{"modality":"TEXT","tokenCount":31}]}"#;
 	let buffered = BufferedResponse {
@@ -1669,6 +1674,7 @@ async fn anthropic_count_tokens_preserves_upstream_errors() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	});
 	let req = LLMRequest {
 		input_tokens: None,
@@ -1681,6 +1687,7 @@ async fn anthropic_count_tokens_preserves_upstream_errors() {
 		prompt: None,
 		provider_state: None,
 		safeguards: None,
+		transport_hints: Default::default(),
 	};
 	let body =
 		bytes::Bytes::from_static(br#"{"message":"The provided model does not support CountTokens"}"#);
@@ -2015,6 +2022,7 @@ async fn bedrock_transformed_provider_model_is_used_for_upstream_path() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	});
 	let inputs = setup_proxy_test("{}").unwrap().pi;
 	let backend_info = BackendInfo {
@@ -2097,6 +2105,7 @@ async fn bedrock_provider_model_overrides_client_model() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	});
 	let inputs = setup_proxy_test("{}").unwrap().pi;
 	let backend_info = BackendInfo {
@@ -2577,6 +2586,7 @@ async fn process_response_routes_streaming_error_to_buffered_path() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	});
 
 	let error_json = r#"{"message":"Expected toolResult blocks at messages.2.content for the following Ids: tooluse_abc123"}"#;
@@ -2592,6 +2602,7 @@ async fn process_response_routes_streaming_error_to_buffered_path() {
 		prompt: None,
 		provider_state: None,
 		safeguards: None,
+		transport_hints: Default::default(),
 	};
 
 	let body = Body::from(error_json.as_bytes().to_vec());
@@ -2856,6 +2867,7 @@ async fn process_streaming_bedrock_completions_normalizes_sse_headers_and_done()
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	});
 
 	let body = Body::from(
@@ -2887,6 +2899,7 @@ async fn process_streaming_bedrock_completions_normalizes_sse_headers_and_done()
 				prompt: None,
 				provider_state: None,
 				safeguards: None,
+				transport_hints: Default::default(),
 			},
 			LLMResponsePolicies::default(),
 			None,
@@ -2997,6 +3010,7 @@ fn setup_request_custom_path_override_wins_over_format_path() {
 		prompt: None,
 		provider_state: None,
 		safeguards: None,
+		transport_hints: Default::default(),
 	};
 	let mut req = crate::http::tests_common::request(
 		"https://proxy.example.com/v1/chat/completions?trace=repro",
@@ -3034,6 +3048,7 @@ fn setup_request_drops_inbound_query_only_when_translated() {
 		prompt: None,
 		provider_state: None,
 		safeguards: None,
+		transport_hints: Default::default(),
 	};
 	for (provider, route_type, expected_query) in [
 		(
@@ -3057,6 +3072,7 @@ fn setup_request_drops_inbound_query_only_when_translated() {
 				guardrail_identifier: None,
 				guardrail_version: None,
 				endpoint_preference: bedrock::BedrockEndpointPreference::MantleOnly,
+				transport: Default::default(),
 			}),
 			RouteType::Messages,
 			Some("beta=true"),
@@ -3111,6 +3127,7 @@ fn setup_request_custom_generate_content_defaults_to_the_native_path() {
 			prompt: None,
 			provider_state: Some(ProviderState::VertexGemini),
 			safeguards: None,
+			transport_hints: Default::default(),
 		};
 		let mut req = crate::http::tests_common::request(
 			"https://gemini.example.com/v1beta/models/gemini-2.5-flash:generateContent",
@@ -3152,6 +3169,7 @@ fn setup_request_custom_count_tokens_defaults_to_the_native_path() {
 		prompt: None,
 		provider_state: None,
 		safeguards: None,
+		transport_hints: Default::default(),
 	};
 	let mut req = crate::http::tests_common::request(
 		"https://gemini.example.com/v1beta/models/gemini-2.5-flash:countTokens",
@@ -3191,6 +3209,7 @@ fn llm_request_for_path(request_model: &str) -> LLMRequest {
 		prompt: None,
 		provider_state: None,
 		safeguards: None,
+		transport_hints: Default::default(),
 	}
 }
 
@@ -3236,6 +3255,7 @@ fn native_gemini_llm_request(request_model: &str, streaming: bool) -> LLMRequest
 		prompt: None,
 		provider_state: Some(ProviderState::VertexGemini),
 		safeguards: None,
+		transport_hints: Default::default(),
 	}
 }
 
@@ -3364,6 +3384,7 @@ fn setup_request_gemini_without_native_state_keeps_compat_path() {
 		input_format: InputFormat::Completions,
 		provider_state: None,
 		safeguards: None,
+		transport_hints: Default::default(),
 		..native_gemini_llm_request("gemini-2.5-flash", false)
 	};
 	let mut req = crate::http::tests_common::request(
@@ -3424,6 +3445,7 @@ fn setup_request_bedrock_applies_path_prefix_with_host_override() {
 			guardrail_identifier: None,
 			guardrail_version: None,
 			endpoint_preference: Default::default(),
+			transport: Default::default(),
 		}),
 		"anthropic.claude-3-5-sonnet-20241022-v2:0",
 		"/proxy/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse",
@@ -3439,6 +3461,7 @@ fn setup_request_bedrock_sets_signing_region_with_host_override() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: Default::default(),
+		transport: Default::default(),
 	});
 	let mut req = crate::http::tests_common::request(
 		"https://bedrock-vpce.example.com/model/example/converse",
@@ -3555,6 +3578,7 @@ async fn bedrock_from_messages_stream_captures_completion() {
 			prompt: None,
 			provider_state: None,
 			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	};
@@ -3606,6 +3630,7 @@ async fn bedrock_from_messages_stream_skips_completion_when_disabled() {
 			prompt: None,
 			provider_state: None,
 			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	};
@@ -3654,6 +3679,7 @@ async fn bedrock_from_messages_stream_captures_tool_calls() {
 			prompt: None,
 			provider_state: None,
 			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	};
@@ -3714,6 +3740,7 @@ async fn messages_passthrough_stream_captures_completion() {
 			prompt: None,
 			provider_state: None,
 			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	};
@@ -3763,6 +3790,7 @@ async fn messages_passthrough_stream_skips_completion_when_disabled() {
 			prompt: None,
 			provider_state: None,
 			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	};
@@ -3808,6 +3836,7 @@ async fn messages_passthrough_stream_captures_tool_calls() {
 			prompt: None,
 			provider_state: None,
 			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	};
@@ -3864,6 +3893,7 @@ async fn responses_passthrough_stream_captures_completion_and_tool_calls() {
 			prompt: None,
 			provider_state: None,
 			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	};
@@ -3928,6 +3958,7 @@ data: [DONE]
 			prompt: None,
 			provider_state: None,
 			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	};
@@ -3966,6 +3997,7 @@ async fn responses_passthrough_stream_skips_completion_when_disabled() {
 			prompt: None,
 			provider_state: None,
 			safeguards: None,
+			transport_hints: Default::default(),
 		},
 		response: LLMResponse::default(),
 	};
@@ -4224,6 +4256,7 @@ fn fixed_providers_classify_by_family() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: bedrock::BedrockEndpointPreference::MantleOnly,
+		transport: Default::default(),
 	}));
 	for (path, expected) in [
 		(
@@ -4390,6 +4423,7 @@ async fn toolsearch_request_to_bedrock_converse_is_rejected() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: bedrock::BedrockEndpointPreference::RuntimePreferred,
+		transport: Default::default(),
 	}));
 	let result = process_toolsearch_messages(
 		&provider,
@@ -4428,6 +4462,7 @@ async fn streaming_toolsearch_request_to_bedrock_is_rejected_before_sse() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: bedrock::BedrockEndpointPreference::RuntimePreferred,
+		transport: Default::default(),
 	}));
 	let result = process_toolsearch_messages(
 		&provider,
@@ -4450,6 +4485,7 @@ async fn tool_reference_history_alone_is_rejected_on_conversion() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: bedrock::BedrockEndpointPreference::RuntimePreferred,
+		transport: Default::default(),
 	}));
 	let mut body = toolsearch_body("anthropic.claude-sonnet-4-5-v1:0", false);
 	body["tools"].as_array_mut().unwrap().remove(0); // keep only the ordinary deferred custom tool
@@ -4508,6 +4544,61 @@ async fn toolsearch_request_to_anthropic_passes_through() {
 }
 
 #[tokio::test]
+async fn toolsearch_request_to_bedrock_native_messages_passes_through() {
+	// Stage 2026-11-02 discriminator: with the model runtime-verified
+	// (AGENTGATEWAY_TOOL_SEARCH_MODELS) and the backend chat transport set to
+	// native-messages (Runtime InvokeModel), the Tool Search shapes must
+	// reach the wire untouched — the versioned server tool, defer_loading
+	// and tool_reference history all survive the render. Live Bedrock
+	// evidence behind this expectation: the identical body direct-invoked
+	// produced server_tool_use + tool_search_tool_result with a nested
+	// tool_reference, then a tool_use of the discovered tool.
+	let _env = ScopedToolSearchEnv::allow("claude-opus-5-5").await;
+	let provider = AIProvider::Bedrock(BedrockProvider::new(bedrock::Provider {
+		model_override: None,
+		region: strng::new("eu-west-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: bedrock::BedrockEndpointPreference::RuntimePreferred,
+		transport: bedrock::BedrockTransport::NativeMessages,
+	}));
+	let mut body = toolsearch_body("claude-opus-5-5", false);
+	// Exact Stage T2 wire shape (the fixture's unversioned-type entry is
+	// replaced with the live-verified versioned shape).
+	body["tools"][0] = json!({
+		"type": "tool_search_tool_regex_20251119",
+		"name": "tool_search_tool_regex"
+	});
+	let result = process_toolsearch_messages(&provider, body).await.unwrap();
+	let RequestResult::Success { request, .. } = result else {
+		panic!("bedrock native passthrough must succeed, got {result:?}");
+	};
+	let bytes = http_body_util::BodyExt::collect(request.into_body())
+		.await
+		.unwrap()
+		.to_bytes();
+	let rendered: Value = serde_json::from_slice(&bytes).unwrap();
+	let rendered_str = rendered.to_string();
+	assert!(
+		rendered_str.contains("tool_search_tool_regex_20251119"),
+		"versioned server tool must survive the native render: {rendered}"
+	);
+	assert!(
+		rendered_str.contains("defer_loading"),
+		"defer_loading must survive the native render: {rendered}"
+	);
+	assert!(
+		rendered_str.contains("tool_reference"),
+		"tool_reference history must survive the native render: {rendered}"
+	);
+	assert_eq!(
+		rendered["anthropic_version"].as_str(),
+		Some("bedrock-2023-05-31"),
+		"InvokeModel envelope must be owned by the gateway"
+	);
+}
+
+#[tokio::test]
 async fn verified_model_toolsearch_on_bedrock_mantle_is_rejected() {
 	// Bedrock Mantle serving a Claude model speaks the Anthropic Messages wire
 	// format — the SHAPE survives verbatim — but wire-format acceptance is not
@@ -4523,6 +4614,7 @@ async fn verified_model_toolsearch_on_bedrock_mantle_is_rejected() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: bedrock::BedrockEndpointPreference::MantleOnly,
+		transport: Default::default(),
 	}));
 	let result = process_toolsearch_messages(
 		&provider,
@@ -4805,6 +4897,7 @@ async fn ordinary_tools_request_to_bedrock_converse_still_converts() {
 		guardrail_identifier: None,
 		guardrail_version: None,
 		endpoint_preference: bedrock::BedrockEndpointPreference::RuntimePreferred,
+		transport: Default::default(),
 	}));
 	let body = json!({
 		"model": "anthropic.claude-sonnet-4-5-v1:0",
@@ -4823,5 +4916,63 @@ async fn ordinary_tools_request_to_bedrock_converse_still_converts() {
 	assert!(
 		matches!(result, RequestResult::Success { .. }),
 		"ordinary tools must keep converting as before, got {result:?}"
+	);
+}
+
+#[test]
+fn bedrock_native_transport_qualifies_for_tool_search_guard() {
+	fn bedrock(transport: bedrock::BedrockTransport) -> AIProvider {
+		AIProvider::Bedrock(BedrockProvider::new(bedrock::Provider {
+			model_override: None,
+			region: strng::new("eu-west-1"),
+			guardrail_identifier: None,
+			guardrail_version: None,
+			endpoint_preference: bedrock::BedrockEndpointPreference::RuntimePreferred,
+			transport,
+		}))
+	}
+
+	// Converse and (implicitly) Mantle legs never qualify: failover from a
+	// native backend onto them must keep hitting the strict guard.
+	assert!(!bedrock(bedrock::BedrockTransport::Converse)
+		.provider_serves_native_tool_search());
+
+	// A native-messages backend qualifies — Runtime InvokeModel is the AWS
+	// documented Tool Search surface — so genuine Tool Search shapes are
+	// served, not rejected.
+	assert!(bedrock(bedrock::BedrockTransport::NativeMessages)
+		.provider_serves_native_tool_search());
+}
+
+#[test]
+fn bedrock_native_transport_serves_messages_format_on_runtime() {
+	fn bedrock(transport: bedrock::BedrockTransport) -> AIProvider {
+		AIProvider::Bedrock(BedrockProvider::new(bedrock::Provider {
+			model_override: None,
+			region: strng::new("eu-west-1"),
+			guardrail_identifier: None,
+			guardrail_version: None,
+			endpoint_preference: bedrock::BedrockEndpointPreference::RuntimePreferred,
+			transport,
+		}))
+	}
+
+	let native = bedrock(bedrock::BedrockTransport::NativeMessages);
+	// Messages input rides the native passthrough translation.
+	assert_eq!(
+		native
+			.chat_translation(InputFormat::Messages, "global.anthropic.claude-opus-5-5", None)
+			.unwrap()
+			.output,
+		ChatFormat::AnthropicMessages
+	);
+	// Responses input still falls back to Converse (no Responses→Messages
+	// conversion exists; failing closed to the proven translation).
+	assert_eq!(
+		native
+			.chat_translation(InputFormat::Responses, "global.anthropic.claude-opus-5-5", None)
+			.unwrap()
+			.output,
+		ChatFormat::BedrockConverse
 	);
 }

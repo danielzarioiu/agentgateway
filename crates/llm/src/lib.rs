@@ -261,6 +261,26 @@ pub struct LLMRequest {
 	/// the response locally (non-native leg). Never logged or serialized.
 	#[serde(skip)]
 	pub safeguards: Option<Arc<types::safeguards::SafeguardsReviewPlan>>,
+	/// Transport/hints set by the request renderer for the selected upstream
+	/// wire format. Never logged or serialized beyond the telemetry
+	/// attribute derived from it.
+	#[serde(skip)]
+	pub transport_hints: TransportHints,
+}
+
+/// Request-render facts that downstream accounting/telemetry need but that
+/// are not part of the client wire contract.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransportHints {
+	/// The upstream is the Bedrock Runtime native Anthropic Messages
+	/// transport (`InvokeModel`/`InvokeModelWithResponseStream`) — used for
+	/// the `gen_ai.provider.transport` telemetry attribute.
+	pub bedrock_native_messages: bool,
+	/// The request carried at least one `cache_control` with `ttl: "1h"`.
+	/// Together with the provider-reported cache-write aggregate this makes
+	/// the 5m/1h attribution provable or explicitly ambiguous (never
+	/// guessed) on the native transport.
+	pub cache_1h_requested: bool,
 }
 
 #[derive(Debug, Clone)]
