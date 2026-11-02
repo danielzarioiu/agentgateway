@@ -4544,6 +4544,61 @@ async fn toolsearch_request_to_anthropic_passes_through() {
 }
 
 #[tokio::test]
+async fn toolsearch_request_to_bedrock_native_messages_passes_through() {
+	// Stage 2026-11-02 discriminator: with the model runtime-verified
+	// (AGENTGATEWAY_TOOL_SEARCH_MODELS) and the backend chat transport set to
+	// native-messages (Runtime InvokeModel), the Tool Search shapes must
+	// reach the wire untouched — the versioned server tool, defer_loading
+	// and tool_reference history all survive the render. Live Bedrock
+	// evidence behind this expectation: the identical body direct-invoked
+	// produced server_tool_use + tool_search_tool_result with a nested
+	// tool_reference, then a tool_use of the discovered tool.
+	let _env = ScopedToolSearchEnv::allow("claude-opus-5-5").await;
+	let provider = AIProvider::Bedrock(BedrockProvider::new(bedrock::Provider {
+		model_override: None,
+		region: strng::new("eu-west-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: bedrock::BedrockEndpointPreference::RuntimePreferred,
+		transport: bedrock::BedrockTransport::NativeMessages,
+	}));
+	let mut body = toolsearch_body("claude-opus-5-5", false);
+	// Exact Stage T2 wire shape (the fixture's unversioned-type entry is
+	// replaced with the live-verified versioned shape).
+	body["tools"][0] = json!({
+		"type": "tool_search_tool_regex_20251119",
+		"name": "tool_search_tool_regex"
+	});
+	let result = process_toolsearch_messages(&provider, body).await.unwrap();
+	let RequestResult::Success { request, .. } = result else {
+		panic!("bedrock native passthrough must succeed, got {result:?}");
+	};
+	let bytes = http_body_util::BodyExt::collect(request.into_body())
+		.await
+		.unwrap()
+		.to_bytes();
+	let rendered: Value = serde_json::from_slice(&bytes).unwrap();
+	let rendered_str = rendered.to_string();
+	assert!(
+		rendered_str.contains("tool_search_tool_regex_20251119"),
+		"versioned server tool must survive the native render: {rendered}"
+	);
+	assert!(
+		rendered_str.contains("defer_loading"),
+		"defer_loading must survive the native render: {rendered}"
+	);
+	assert!(
+		rendered_str.contains("tool_reference"),
+		"tool_reference history must survive the native render: {rendered}"
+	);
+	assert_eq!(
+		rendered["anthropic_version"].as_str(),
+		Some("bedrock-2023-05-31"),
+		"InvokeModel envelope must be owned by the gateway"
+	);
+}
+
+#[tokio::test]
 async fn verified_model_toolsearch_on_bedrock_mantle_is_rejected() {
 	// Bedrock Mantle serving a Claude model speaks the Anthropic Messages wire
 	// format — the SHAPE survives verbatim — but wire-format acceptance is not

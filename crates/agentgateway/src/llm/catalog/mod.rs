@@ -747,10 +747,24 @@ fn usage_for(
 		.saturating_sub(reasoning)
 		.saturating_sub(output_audio);
 
+	// Extended-TTL (1h) cache-write subcount, from the provider-reported TTL
+	// split. Only tracked when cache writes are priced — mirroring the
+	// aggregate zeroing above — and clamped to the (post-convention) write
+	// total. When the catalog lacks a distinct 1h rate, `breakdown` falls
+	// back to the plain cache-write rate, so this subcount is inert there.
+	let cache_write_1h = if prices_cache_write {
+		resp.cache_creation_1h_input_tokens
+			.unwrap_or(0)
+			.min(cache_write)
+	} else {
+		0
+	};
+
 	Usage {
 		input,
 		cache_read,
 		cache_write,
+		cache_write_1h,
 		output,
 		reasoning,
 		input_audio,
@@ -932,6 +946,82 @@ mod tests {
 		assert_eq!(u.input, 800);
 		assert_eq!(u.cache_read, 0);
 		assert_eq!(u.cache_write, 200);
+	}
+
+	#[test]
+	fn usage_carries_1h_write_split_when_priced() {
+		// Stage 2026-11-02: native Anthropic responses report the TTL split
+		// (ephemeral_5m/ephemeral_1h); the inline usage must carry the 1h
+		// subcount so repricing can apply the distinct rate.
+		let resp = LLMResponse {
+			input_tokens: Some(1000),
+			cache_creation_input_tokens: Some(6841),
+			cache_creation_5m_input_tokens: Some(0),
+			cache_creation_1h_input_tokens: Some(6841),
+			output_tokens: Some(100),
+			..Default::default()
+		};
+		let u = usage_for(CacheTokenConvention::InputExcludesCache, &resp, true, true);
+		assert_eq!(u.cache_write, 6841);
+		assert_eq!(u.cache_write_1h, 6841);
+	}
+
+	#[test]
+	fn usage_1h_split_clamped_and_zeroed_consistently_with_writes() {
+		// Split larger than the aggregate is clamped; when cache writes are
+		// NOT priced the subcount is zeroed together with the aggregate.
+		let resp = LLMResponse {
+			input_tokens: Some(1000),
+			cache_creation_input_tokens: Some(500),
+			cache_creation_1h_input_tokens: Some(900),
+			..Default::default()
+		};
+		let u = usage_for(CacheTokenConvention::InputExcludesCache, &resp, true, true);
+		assert_eq!(u.cache_write, 500);
+		assert_eq!(u.cache_write_1h, 500, "clamped to the write total");
+		let u = usage_for(CacheTokenConvention::InputExcludesCache, &resp, true, false);
+		assert_eq!(u.cache_write, 0);
+		assert_eq!(u.cache_write_1h, 0, "zeroed when writes are unpriced");
+	}
+
+	#[test]
+	fn usage_split_absent_when_provider_reports_aggregate_only() {
+		let resp = LLMResponse {
+			input_tokens: Some(1000),
+			cache_creation_input_tokens: Some(500),
+			..Default::default()
+		};
+		let u = usage_for(CacheTokenConvention::InputExcludesCache, &resp, true, true);
+		assert_eq!(u.cache_write_1h, 0);
+	}
+
+	#[test]
+	fn builtin_global_opus_5_5_card_carries_the_1h_write_rate() {
+		// F2: the effective Bedrock global card must price 1h writes at the
+		// distinct rate. Stage 2026-11-02 measured the aggregate-rate
+		// fallback underpricing the live 6841-token 1h row by exactly
+		// $0.020523 while this field was absent from the card.
+		let catalog = model::from_json(BUILTIN_CATALOG_JSON).expect("builtin catalog parses");
+		let global =
+			&catalog.providers["aws.bedrock"].models["global.anthropic.claude-opus-5-5"];
+		assert_eq!(
+			global.rates.cache_write,
+			Some(model::Money::parse("5").unwrap())
+		);
+		assert_eq!(
+			global.rates.cache_write_1h,
+			Some(model::Money::parse("8").unwrap())
+		);
+		// The no-prefix Bedrock id carries the same verified card.
+		let no_prefix = &catalog.providers["aws.bedrock"].models["anthropic.claude-opus-5-5"];
+		assert_eq!(
+			no_prefix.rates.cache_write_1h,
+			Some(model::Money::parse("8").unwrap())
+		);
+		// Regional-prefixed variants (4.4 base card) are intentionally left
+		// on the 5m-only fallback: their 1h rate is not Stage-verified.
+		let eu = &catalog.providers["aws.bedrock"].models["eu.anthropic.claude-opus-5-5"];
+		assert_eq!(eu.rates.cache_write_1h, None);
 	}
 
 	#[test]
