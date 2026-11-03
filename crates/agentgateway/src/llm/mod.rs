@@ -243,6 +243,45 @@ impl std::ops::DerefMut for AzureProvider {
 	}
 }
 
+/// Sanitized diagnostic fingerprint of an upstream 4xx body: the structured
+/// error fields only (Anthropic `error.type`/`error.message` or the AWS JSON
+/// `__type`/`message`), never the raw body. ARNs and any long token-like
+/// sequence are redacted before logging; the message is truncated. Upstream
+/// validation errors carry no prompt content — this closes the gap that left
+/// the 2026-11-03 native-era 400s unclassifiable post-hoc (exact class
+/// reproducible, per-incident class unprovable without it).
+fn upstream_client_error_diagnostic(bytes: &[u8]) -> Option<(String, String)> {
+	static ARN: std::sync::LazyLock<regex::Regex> =
+		std::sync::LazyLock::new(|| regex::Regex::new(r"arn:aws:[a-z0-9:*/-]+").unwrap());
+	static TOKEN: std::sync::LazyLock<regex::Regex> =
+		std::sync::LazyLock::new(|| regex::Regex::new(r"[A-Za-z0-9_\-/=+]{64,}").unwrap());
+	let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+	let (error_type, message) = if let Some(err) = v.get("error").filter(|e| e.is_object()) {
+		(
+			err
+				.get("type")
+				.and_then(|t| t.as_str())
+				.unwrap_or("unknown"),
+			err.get("message").and_then(|m| m.as_str()).unwrap_or(""),
+		)
+	} else {
+		(
+			v.get("__type")
+				.and_then(|t| t.as_str())
+				.unwrap_or("unknown"),
+			v.get("message").and_then(|m| m.as_str()).unwrap_or(""),
+		)
+	};
+	if error_type == "unknown" && message.is_empty() {
+		return None;
+	}
+	// Redact ARNs and long opaque tokens; truncate hard.
+	let arn_redacted = ARN.replace_all(message, "[arn-redacted]");
+	let redacted = TOKEN.replace_all(&arn_redacted, "[token-redacted]");
+	let message = redacted.chars().take(240).collect::<String>();
+	Some((error_type.to_string(), message))
+}
+
 impl AIProvider {
 	pub fn bedrock(provider: bedrock::Provider) -> Self {
 		Self::Bedrock(BedrockProvider::new(provider))
@@ -3611,6 +3650,20 @@ impl AIProvider {
 		bytes: &Bytes,
 		catalog: agent_llm::model_catalog::Catalog<'_>,
 	) -> Result<Bytes, AIError> {
+		// Narrow upstream-4xx diagnostic: sanitized structured fields only
+		// (see upstream_client_error_diagnostic) — enough to classify the
+		// failure class per incident, never raw bodies.
+		if status.is_client_error() {
+			if let Some((error_type, message)) = upstream_client_error_diagnostic(bytes) {
+				tracing::info!(
+					upstream.status = status.as_u16(),
+					upstream.error_type = %error_type,
+					upstream.error_message = %message,
+					model = %req.request_model,
+					"upstream 4xx diagnostic"
+				);
+			}
+		}
 		if req.input_format.is_chat() {
 			let translation = self.chat_translation(req.input_format, &req.request_model, catalog)?;
 			return translation.error(

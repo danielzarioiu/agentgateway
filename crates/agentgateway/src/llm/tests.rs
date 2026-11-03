@@ -4982,3 +4982,34 @@ fn bedrock_native_transport_serves_messages_format_on_runtime() {
 		ChatFormat::BedrockConverse
 	);
 }
+
+#[test]
+fn upstream_client_error_diagnostic_extracts_and_redacts() {
+	use super::upstream_client_error_diagnostic;
+	// Anthropic envelope — the native Messages validation classes observed
+	// live (marker count / TTL ordering).
+	let a = upstream_client_error_diagnostic(
+		br#"{"type":"error","request_id":"r1","error":{"type":"invalid_request_error","message":"A maximum of 4 blocks with cache_control may be provided. Found 5."}}"#,
+	);
+	let (t, m) = a.expect("anthropic envelope extracts");
+	assert_eq!(t, "invalid_request_error");
+	assert!(m.contains("maximum of 4 blocks"));
+	assert!(
+		!m.contains("request_id"),
+		"no request id leaks from the envelope root"
+	);
+
+	// AWS envelope with an ARN and a long opaque token: both redacted.
+	let b = upstream_client_error_diagnostic(
+		br#"{"__type":"AccessDeniedException","message":"not authorized to perform: bedrock-mantle:CountTokens on resource: arn:aws:bedrock-mantle:us-east-1:123456789012:project/default sig=AVeryLongOpaqueSignatureTokenValue1234567890123456789012345678901234567890"}"#,
+	);
+	let (t2, m2) = b.expect("aws envelope extracts");
+	assert_eq!(t2, "AccessDeniedException");
+	assert!(m2.contains("[arn-redacted]"), "arn redacted: {m2}");
+	assert!(m2.contains("[token-redacted]"), "token redacted: {m2}");
+	assert!(!m2.contains("123456789012"));
+
+	// Non-JSON body -> no diagnostic (never log raw bytes).
+	let c = upstream_client_error_diagnostic(b"<html>bad</html>");
+	assert!(c.is_none());
+}
