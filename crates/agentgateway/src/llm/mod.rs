@@ -243,20 +243,80 @@ impl std::ops::DerefMut for AzureProvider {
 	}
 }
 
-/// Sanitized diagnostic fingerprint of an upstream 4xx body: the structured
-/// error fields only (Anthropic `error.type`/`error.message` or the AWS JSON
-/// `__type`/`message`), never the raw body. ARNs and any long token-like
-/// sequence are redacted before logging; the message is truncated. Upstream
-/// validation errors carry no prompt content — this closes the gap that left
-/// the 2026-11-03 native-era 400s unclassifiable post-hoc (exact class
-/// reproducible, per-incident class unprovable without it).
-fn upstream_client_error_diagnostic(bytes: &[u8]) -> Option<(String, String)> {
-	static ARN: std::sync::LazyLock<regex::Regex> =
-		std::sync::LazyLock::new(|| regex::Regex::new(r"arn:aws:[a-z0-9:*/-]+").unwrap());
-	static TOKEN: std::sync::LazyLock<regex::Regex> =
-		std::sync::LazyLock::new(|| regex::Regex::new(r"[A-Za-z0-9_\-/=+]{64,}").unwrap());
+/// Classified upstream-4xx diagnostic.
+///
+/// Privacy policy: the provider's free-form error `message` is NEVER emitted
+/// verbatim — not even truncated or pattern-redacted. It is either matched
+/// against an anchored, evidence-backed validation template (emitting a
+/// stable class name plus digits-only parameters) or reduced to a
+/// non-reversible fingerprint plus length for recurrence correlation.
+/// Arbitrary upstream text — prompt excerpts, emails, account identifiers,
+/// short secrets, nested payload content — therefore cannot reach
+/// operational logs by construction, rather than by redaction coverage.
+///
+/// Request correlation stays in the established tracing/span metadata
+/// (trace_id and the gateway telemetry attributes), which is where
+/// post-hoc incident analysis already joins logs to traces.
+#[derive(Debug, PartialEq)]
+struct UpstreamClientErrorDiagnostic {
+	/// Structured error class from the provider envelope (Anthropic
+	/// `error.type` / AWS `__type`), charset-restricted and bounded.
+	error_type: String,
+	/// Stable template class name when the message matches a known
+	/// validation family; `None` otherwise (logged as "unclassified").
+	class: Option<&'static str>,
+	/// Digits-only template parameters (e.g. "max=4,found=5"); "-" when
+	/// unclassified. Never carries provider text.
+	params: String,
+	/// 16-hex FNV-1a of the raw message — recurrence correlation without
+	/// content.
+	fingerprint: String,
+	/// Raw message length in bytes, bounded context for triage.
+	message_bytes: usize,
+}
+
+/// Restrict the provider-supplied error type to a safe charset and length.
+fn sanitize_error_type(raw: &str) -> String {
+	raw
+		.chars()
+		.filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '#'))
+		.take(80)
+		.collect()
+}
+
+fn fnv1a64(data: &[u8]) -> u64 {
+	let mut hash: u64 = 0xcbf29ce484222325;
+	for byte in data {
+		hash ^= u64::from(*byte);
+		hash = hash.wrapping_mul(0x100000001b3);
+	}
+	hash
+}
+
+/// Anchored validation templates. Every entry must be backed by an exact,
+/// live-reproduced upstream body — never a paraphrase — and may capture
+/// only digit runs. Extend this table when a new recurring fingerprint is
+/// diagnosed; the class name is the operator-visible replacement for the
+/// message text.
+fn classify_upstream_error_message(message: &str) -> Option<(&'static str, String)> {
+	static CACHE_MARKER_LIMIT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+		regex::Regex::new(
+			r"^A maximum of (\d+) blocks with cache_control may be provided\. Found (\d+)\.$",
+		)
+		.unwrap()
+	});
+	if let Some(caps) = CACHE_MARKER_LIMIT.captures(message) {
+		return Some((
+			"cache_marker_limit_exceeded",
+			format!("max={},found={}", &caps[1], &caps[2]),
+		));
+	}
+	None
+}
+
+fn upstream_client_error_diagnostic(bytes: &[u8]) -> Option<UpstreamClientErrorDiagnostic> {
 	let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-	let (error_type, message) = if let Some(err) = v.get("error").filter(|e| e.is_object()) {
+	let (raw_type, message) = if let Some(err) = v.get("error").filter(|e| e.is_object()) {
 		(
 			err
 				.get("type")
@@ -272,14 +332,20 @@ fn upstream_client_error_diagnostic(bytes: &[u8]) -> Option<(String, String)> {
 			v.get("message").and_then(|m| m.as_str()).unwrap_or(""),
 		)
 	};
-	if error_type == "unknown" && message.is_empty() {
+	if raw_type == "unknown" && message.is_empty() {
 		return None;
 	}
-	// Redact ARNs and long opaque tokens; truncate hard.
-	let arn_redacted = ARN.replace_all(message, "[arn-redacted]");
-	let redacted = TOKEN.replace_all(&arn_redacted, "[token-redacted]");
-	let message = redacted.chars().take(240).collect::<String>();
-	Some((error_type.to_string(), message))
+	let (class, params) = classify_upstream_error_message(message)
+		.map_or((None, "-".to_string()), |(class, params)| {
+			(Some(class), params)
+		});
+	Some(UpstreamClientErrorDiagnostic {
+		error_type: sanitize_error_type(raw_type),
+		class,
+		params,
+		fingerprint: format!("{:016x}", fnv1a64(message.as_bytes())),
+		message_bytes: message.len(),
+	})
 }
 
 impl AIProvider {
@@ -3650,17 +3716,23 @@ impl AIProvider {
 		bytes: &Bytes,
 		catalog: agent_llm::model_catalog::Catalog<'_>,
 	) -> Result<Bytes, AIError> {
-		// Narrow upstream-4xx diagnostic: sanitized structured fields only
-		// (see upstream_client_error_diagnostic) — enough to classify the
-		// failure class per incident, never raw bodies.
+		// Narrow upstream-4xx diagnostic: classified error code plus bounded
+		// structured metadata only (see upstream_client_error_diagnostic) —
+		// the provider message text is never emitted, matched templates
+		// contribute a stable class name and digits-only parameters, and
+		// unknown messages reduce to a fingerprint. Request correlation
+		// rides the existing trace/span metadata.
 		if status.is_client_error() {
-			if let Some((error_type, message)) = upstream_client_error_diagnostic(bytes) {
+			if let Some(diag) = upstream_client_error_diagnostic(bytes) {
 				tracing::info!(
 					upstream.status = status.as_u16(),
-					upstream.error_type = %error_type,
-					upstream.error_message = %message,
+					upstream.error_type = %diag.error_type,
+					upstream.error_class = diag.class.unwrap_or("unclassified"),
+					upstream.error_params = %diag.params,
+					upstream.error_fingerprint = %diag.fingerprint,
+					upstream.error_message_bytes = diag.message_bytes,
 					model = %req.request_model,
-					"upstream 4xx diagnostic"
+					"upstream 4xx classified diagnostic"
 				);
 			}
 		}
