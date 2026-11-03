@@ -32,18 +32,24 @@ pub struct NativeRequest {
 	/// leaves the split genuinely ambiguous and accounting must fail closed
 	/// rather than guess.
 	pub cache_1h_requested: bool,
+	/// Client `anthropic-beta` values removed from the Bedrock-bound request
+	/// (losslessly-droppable or unrecognized) — surfaced for observability;
+	/// the rendered body is authoritative.
+	pub dropped_betas: Vec<String>,
 }
 
 /// Render the Anthropic Messages body for Bedrock Runtime InvokeModel.
 ///
-/// Beta resolution: the client's `anthropic-beta` values are forwarded
-/// verbatim into the body-level `anthropic_beta` field by default (the
-/// native transport exists to forward the client's native semantics, and
-/// Bedrock rejects unsupported betas explicitly rather than silently).
-/// When `AGENTGATEWAY_BEDROCK_ANTHROPIC_BETA_HEADERS` is explicitly
-/// configured, it acts as a restrictive filter — and a Tool Search request
-/// that loses a required Tool Search beta is rejected outright instead of
-/// silently degraded.
+/// Beta resolution (2026-11-03): client `anthropic-beta` header values AND
+/// any body-level `anthropic_beta` declaration ride
+/// [`super::helpers::native_bedrock_beta_resolution`] together, so a removed
+/// beta can never re-enter through the other representation. Values
+/// documented for Bedrock are forwarded; values whose gated capabilities
+/// Bedrock serves natively without any beta (notably
+/// `advanced-tool-use-2025-11-20` — Tool Search, `tool_reference`,
+/// `defer_loading` — Stage-verified 2026-11-03) are removed losslessly;
+/// recognized unservable betas are rejected with a typed error BEFORE any
+/// AWS invocation instead of silently degraded.
 pub fn translate(
 	req: types::ChatRequest,
 	catalog: crate::model_catalog::Catalog<'_>,
@@ -74,7 +80,6 @@ pub fn translate(
 	}
 
 	let cache_1h_requested = body_requests_1h_cache(&body);
-	let tool_search_request = body_uses_native_tool_search(&body);
 
 	// Required by InvokeModel for Claude models. Overwritten (not merged)
 	// deliberately: a client-supplied `anthropic_version` other than the
@@ -82,27 +87,56 @@ pub fn translate(
 	// owns this envelope field on the native transport.
 	body["anthropic_version"] = json!(BEDROCK_ANTHROPIC_VERSION);
 
-	if let Some(headers) = headers {
-		let raw = super::helpers::extract_beta_headers_raw(headers);
-		let (kept, dropped) = super::helpers::native_beta_resolution(raw);
-		if tool_search_request
-			&& let Some(required) = dropped
-				.iter()
-				.find(|beta| beta.starts_with("tool-search-tool") || beta.starts_with("advanced-tool-use"))
-				.map(|beta| beta.clone())
-		{
-			return Err(AIError::UnsupportedConversion(strng::format!(
-				"anthropic-beta value '{required}' is required by this Tool Search request but is excluded by AGENTGATEWAY_BEDROCK_ANTHROPIC_BETA_HEADERS; refusing rather than silently degrading Tool Search"
-			)));
+	// Beta resolution: client headers AND any body-level `anthropic_beta`
+	// declaration ride the SAME resolution so a removed beta can never
+	// re-enter through the other representation. The gateway owns this
+	// envelope field on the native transport (same as `anthropic_version`).
+	let mut beta_values = headers
+		.map(super::helpers::extract_beta_headers_raw)
+		.unwrap_or_default();
+	if let Some(declared) = body.get("anthropic_beta").and_then(|v| v.as_array()) {
+		for value in declared.iter().filter_map(|v| v.as_str()) {
+			if !beta_values.iter().any(|existing| existing == value) {
+				beta_values.push(value.to_string());
+			}
 		}
-		if !kept.is_empty() {
-			body["anthropic_beta"] = json!(kept);
+	}
+	let mut dropped_betas = Vec::new();
+	if beta_values.is_empty() {
+		// A present-but-empty/non-array body declaration never travels.
+		if body.get("anthropic_beta").is_some() {
+			body
+				.as_object_mut()
+				.expect("body is a JSON object")
+				.remove("anthropic_beta");
+		}
+	} else {
+		match super::helpers::native_bedrock_beta_resolution(beta_values) {
+			Ok(resolution) => {
+				if resolution.kept.is_empty() {
+					body
+						.as_object_mut()
+						.expect("body is a JSON object")
+						.remove("anthropic_beta");
+				} else {
+					body["anthropic_beta"] = json!(resolution.kept);
+				}
+				dropped_betas.extend(resolution.dropped_lossless);
+				dropped_betas.extend(resolution.dropped_unknown);
+			},
+			Err(unsupported) => {
+				return Err(AIError::UnsupportedConversion(strng::format!(
+					"anthropic-beta value(s) [{}] require capabilities the native Bedrock Messages transport cannot serve; rejected before AWS invocation rather than silently degraded",
+					unsupported.join(", ")
+				)));
+			},
 		}
 	}
 
 	Ok(NativeRequest {
 		body: serde_json::to_vec(&body).map_err(AIError::RequestMarshal)?,
 		cache_1h_requested,
+		dropped_betas,
 	})
 }
 
@@ -242,7 +276,12 @@ fn body_requests_1h_cache(body: &serde_json::Value) -> bool {
 /// `tool_search*` server tool type, a `tool_reference` /
 /// `tool_search_tool_result` content part anywhere, or a `server_tool_use`
 /// named `tool_search*`. `defer_loading` alone is deliberately NOT an input
-/// (same semantics as the typed detection).
+/// (same semantics as the typed detection). The 2026-11-03 beta-resolution
+/// rewrite removed its last runtime caller (the old refusal arm — replaced
+/// by `native_bedrock_beta_resolution`, which refuses an env-excluded
+/// documented Tool Search beta instead); kept with its tests as the
+/// documented semantic mirror.
+#[cfg_attr(not(test), allow(dead_code))]
 fn body_uses_native_tool_search(body: &serde_json::Value) -> bool {
 	let mut found = false;
 	walk_json(body, &mut |obj| {
@@ -366,76 +405,229 @@ mod tests {
 	}
 
 	#[test]
-	fn translate_forwards_client_betas_verbatim_by_default() {
-		let mut headers = HeaderMap::new();
-		headers.insert(
-			"anthropic-beta",
-			"claude-code-20250219, tool-search-tool-2025-10-19"
-				.parse()
-				.unwrap(),
-		);
-		headers.append("anthropic-beta", "effort-2025-11-24".parse().unwrap());
-		let (out, _) = translate_body(
-			json!({"model": "claude-sonnet-5-5", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}),
-			Some(headers),
-		)
-		.expect("native translate");
-		let betas: Vec<&str> = out["anthropic_beta"]
-			.as_array()
-			.expect("beta array injected")
-			.iter()
-			.map(|v| v.as_str().expect("string beta"))
-			.collect();
-		assert_eq!(
-			betas,
-			vec![
-				"claude-code-20250219",
-				"tool-search-tool-2025-10-19",
-				"effort-2025-11-24"
-			]
-		);
-	}
-
-	#[test]
-	fn translate_omits_beta_field_without_header() {
-		let (out, _) = translate_body(
+	fn b1_no_beta_header_or_declaration_leaves_body_unchanged() {
+		let (out, native) = translate_body(
 			json!({"model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": "x"}]}),
 			None,
+		)
+		.expect("native translate");
+		assert!(out.get("anthropic_beta").is_none());
+		assert_eq!(out["anthropic_version"], "bedrock-2023-05-31");
+		assert!(native.dropped_betas.is_empty());
+		// Header present but empty: still no envelope field.
+		let mut headers = HeaderMap::new();
+		headers.insert("anthropic-beta", "".parse().unwrap());
+		let (out, _) = translate_body(
+			json!({"model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": "x"}]}),
+			Some(headers),
 		)
 		.expect("native translate");
 		assert!(out.get("anthropic_beta").is_none());
 	}
 
 	#[test]
-	fn translate_rejects_tool_search_request_when_required_beta_filtered() {
-		// Simulates an explicitly configured allow-list that excludes the
-		// Tool Search betas: a Tool Search request must be REJECTED, never
-		// silently degraded.
+	fn b2_claude_code_advanced_beta_plus_versioned_toolsearch_served_without_beta() {
+		// The exact Production-failing shape (2026-11-03): Claude Code sends
+		// `advanced-tool-use-2025-11-20` with a versioned Tool Search tool and
+		// deferred ordinary tools. Bedrock serves all of it natively without
+		// the beta — the beta must be REMOVED, not forwarded, not refused,
+		// with the Tool Search shapes preserved verbatim.
 		let mut headers = HeaderMap::new();
 		headers.insert(
 			"anthropic-beta",
 			"advanced-tool-use-2025-11-20".parse().unwrap(),
 		);
 		let body = json!({
+			"model": "claude-opus-5-5", "max_tokens": 128,
+			"tools": [
+				{"type": "tool_search_tool_regex_20251119", "name": "tool_search",
+				 "domains": ["weather"], "pattern": "weather"},
+				{"name": "get_weather", "description": "weather",
+				 "input_schema": {"type": "object"}, "defer_loading": true},
+				{"name": "mcp__example__list_widgets", "description": "widgets",
+				 "input_schema": {"type": "object"}, "defer_loading": false}
+			],
+			"messages": [{"role": "user", "content": "What tools do you have?"}]
+		});
+		let (out, native) = translate_body(body, Some(headers)).expect("native translate");
+		assert!(
+			out.get("anthropic_beta").is_none(),
+			"unsupported beta must not reach the Bedrock body: {}",
+			out["anthropic_beta"]
+		);
+		// Server-side Tool Search preserved, no eager downgrade.
+		assert_eq!(out["tools"][0]["type"], "tool_search_tool_regex_20251119");
+		assert_eq!(out["tools"][0]["pattern"], "weather");
+		assert_eq!(out["tools"][1]["defer_loading"], true);
+		assert_eq!(out["tools"][2]["name"], "mcp__example__list_widgets");
+		assert_eq!(native.dropped_betas, vec!["advanced-tool-use-2025-11-20"]);
+	}
+
+	#[test]
+	fn b3_supported_beta_retained_unsupported_removed() {
+		// One Bedrock-documented beta + the droppable advanced beta: the
+		// documented value is forwarded, the advanced beta is removed (its
+		// capabilities are served natively — not required).
+		let mut headers = HeaderMap::new();
+		headers.insert(
+			"anthropic-beta",
+			"advanced-tool-use-2025-11-20, effort-2025-11-24"
+				.parse()
+				.unwrap(),
+		);
+		let (out, _) = translate_body(
+			json!({"model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": "x"}]}),
+			Some(headers),
+		)
+		.expect("native translate");
+		assert_eq!(out["anthropic_beta"], json!(["effort-2025-11-24"]));
+	}
+
+	#[test]
+	fn b4_recognized_unservable_beta_rejected_before_aws_invocation() {
+		// A beta gating a capability the native transport cannot serve:
+		// typed fail-closed rejection, zero AWS invocation (translate returns
+		// Err before the body is ever serialized/sent).
+		let mut headers = HeaderMap::new();
+		headers.insert(
+			"anthropic-beta",
+			"fine-grained-tool-streaming-2025-05-14".parse().unwrap(),
+		);
+		let err = translate(
+			native_request_from(
+				json!({"model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": "x"}]}),
+			),
+			None,
+			Some(&headers),
+		)
+		.expect_err("recognized unservable beta must be rejected");
+		match err {
+			crate::AIError::UnsupportedConversion(message) => {
+				assert!(
+					message.contains("fine-grained-tool-streaming-2025-05-14"),
+					"typed error names the beta: {message}"
+				);
+				assert!(
+					message.contains("rejected before AWS invocation"),
+					"typed error states the fail-closed semantics: {message}"
+				);
+			},
+			other => panic!("expected UnsupportedConversion, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn b5_beta_normalization_dedup_order_and_body_level_declarations() {
+		// Mixed header-name casing, repeated headers, duplicates inside
+		// comma-joined values, and a body-level `anthropic_beta` declaration
+		// all collapse into ONE deterministic resolution; a removed beta is
+		// never reintroduced through the body.
+		let mut headers = HeaderMap::new();
+		headers.insert(
+			"Anthropic-Beta",
+			"advanced-tool-use-2025-11-20, effort-2025-11-24"
+				.parse()
+				.unwrap(),
+		);
+		headers.append(
+			"anthropic-beta",
+			"advanced-tool-use-2025-11-20".parse().unwrap(),
+		);
+		headers.append(
+			"anthropic-beta",
+			"tool-search-tool-2025-10-19".parse().unwrap(),
+		);
+		let body = json!({
 			"model": "m", "max_tokens": 1,
-			"tools": [{"name": "t", "input_schema": {"type": "object"}, "defer_loading": true}],
-			"messages": [{"role": "user", "content": [
-				{"type": "tool_result", "tool_use_id": "srvtoolu_1", "content": [
-					{"type": "tool_reference", "tool_name": "t"}]}]}]
+			"anthropic_beta": ["effort-2025-11-24", "claude-code-20250219"],
+			"messages": [{"role": "user", "content": "x"}]
 		});
-		let native = translate(native_request_from(body), None, Some(&headers))
-			.expect("translate reaches beta resolution");
-		let raw = helpers::extract_beta_headers_raw(&{
-			let mut h = HeaderMap::new();
-			h.insert(
-				"anthropic-beta",
-				"advanced-tool-use-2025-11-20".parse().unwrap(),
-			);
-			h
+		let (out, native) = translate_body(body, Some(headers)).expect("native translate");
+		// Deduplicated, order-preserving, documented-only set forwarded.
+		assert_eq!(
+			out["anthropic_beta"],
+			json!(["effort-2025-11-24", "tool-search-tool-2025-10-19"])
+		);
+		let mut dropped = native.dropped_betas.clone();
+		dropped.sort();
+		assert_eq!(
+			dropped,
+			vec!["advanced-tool-use-2025-11-20", "claude-code-20250219"]
+		);
+
+		// Body-level declaration alone (no headers): removed values never
+		// re-enter through the body representation.
+		let body_only = json!({
+			"model": "m", "max_tokens": 1,
+			"anthropic_beta": ["advanced-tool-use-2025-11-20", "interleaved-thinking-2025-05-14"],
+			"messages": [{"role": "user", "content": "x"}]
 		});
-		let (kept, dropped) = helpers::native_beta_resolution_with(raw, true);
-		assert!(kept.is_empty() && !dropped.is_empty());
-		let _ = native; // request-level shape validated above
+		let (out2, _) = translate_body(body_only, None).expect("native translate");
+		assert_eq!(
+			out2["anthropic_beta"],
+			json!(["interleaved-thinking-2025-05-14"])
+		);
+
+		// Non-array body declaration never travels.
+		let malformed = json!({
+			"model": "m", "max_tokens": 1,
+			"anthropic_beta": "advanced-tool-use-2025-11-20",
+			"messages": [{"role": "user", "content": "x"}]
+		});
+		let (out3, _) = translate_body(malformed, None).expect("native translate");
+		assert!(out3.get("anthropic_beta").is_none());
+	}
+
+	#[test]
+	fn guard_documented_toolsearch_beta_excluded_by_env_still_refuses() {
+		// The Tool Search guard is NOT disabled: an operator explicitly
+		// excluding a documented Tool Search beta from
+		// AGENTGATEWAY_BEDROCK_ANTHROPIC_BETA_HEADERS still gets a typed
+		// refusal (never silent degradation) — only the stage-PROVEN
+		// droppable betas are removed.
+		let allowed: Vec<String> = vec!["effort-2025-11-24".to_string()];
+		let err = helpers::native_bedrock_beta_resolution_with(
+			vec!["tool-search-tool-2025-10-19".to_string()],
+			&allowed,
+		)
+		.expect_err("excluded documented Tool Search beta must refuse");
+		assert_eq!(err, vec!["tool-search-tool-2025-10-19".to_string()]);
+
+		// The stage-proven droppable beta is dropped losslessly under the
+		// same restricted allow-list (Bedrock serves TS without it).
+		let ok = helpers::native_bedrock_beta_resolution_with(
+			vec![
+				"advanced-tool-use-2025-11-20".to_string(),
+				"effort-2025-11-24".to_string(),
+			],
+			&allowed,
+		)
+		.expect("droppable beta resolves");
+		assert_eq!(ok.kept, vec!["effort-2025-11-24".to_string()]);
+		assert_eq!(
+			ok.dropped_lossless,
+			vec!["advanced-tool-use-2025-11-20".to_string()]
+		);
+		assert!(ok.dropped_unknown.is_empty());
+	}
+
+	#[test]
+	fn unknown_betas_are_dropped_conservatively_not_forwarded() {
+		// Bedrock InvokeModel rejects every undocumented body-level beta
+		// value outright, and Converse has never forwarded client betas:
+		// unrecognized values are removed (and surfaced), never forwarded.
+		let mut headers = HeaderMap::new();
+		headers.insert(
+			"anthropic-beta",
+			"some-future-beta-20300101".parse().unwrap(),
+		);
+		let (out, native) = translate_body(
+			json!({"model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": "x"}]}),
+			Some(headers),
+		)
+		.expect("native translate");
+		assert!(out.get("anthropic_beta").is_none());
+		assert_eq!(native.dropped_betas, vec!["some-future-beta-20300101"]);
 	}
 
 	#[test]

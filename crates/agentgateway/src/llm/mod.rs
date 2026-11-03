@@ -578,6 +578,15 @@ fn render_bedrock_native_messages(
 	let _ = provider;
 	let native =
 		conversion::bedrock::from_messages_native::translate(req, ctx.catalog, Some(ctx.headers))?;
+	if !native.dropped_betas.is_empty() {
+		// Beta NAMES only (never values of other headers): identifies which
+		// client betas the native transport removed — the §8 monitoring
+		// signal for unexpected beta-classes on real traffic.
+		info!(
+			bedrock.native.betas_dropped = ?native.dropped_betas,
+			"removed client anthropic-beta values not forwarded on the native Bedrock transport"
+		);
+	}
 	Ok(RenderedChatRequest {
 		body: native.body,
 		// Deliberately no ProviderState::Bedrock: the tool-name map must not

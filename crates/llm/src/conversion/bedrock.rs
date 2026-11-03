@@ -3953,31 +3953,97 @@ mod helpers {
 		out
 	}
 
-	/// Native-transport beta resolution: `(kept, dropped)`. Verbatim
-	/// (everything kept) unless an explicit env allow-list is configured —
-	/// unset env, or a value list containing only the `default` sentinel
-	/// (plus blanks), means "no restriction".
-	pub fn native_beta_resolution(values: Vec<String>) -> (Vec<String>, Vec<String>) {
-		let explicit = std::env::var(ALLOWED_BETA_HEADERS_ENV).is_ok_and(|v| {
-			!v.split(',')
-				.map(str::trim)
-				.all(|feature| feature.is_empty() || feature == DEFAULT_SENTINEL)
-		});
-		native_beta_resolution_with(values, explicit)
+	/// Beta values removed from the Bedrock-bound native request without any
+	/// loss of served capability:
+	/// - `advanced-tool-use-2025-11-20` gates, on the Anthropic API, exactly
+	///   the capabilities Bedrock Runtime `InvokeModel` serves natively with
+	///   NO beta — the versioned Tool Search server tools
+	///   (`tool_search_tool_regex_20251119` / `tool_search_tool_bm25_20251119`),
+	///   `tool_reference` blocks and `defer_loading` — verified live on Stage
+	///   2026-11-03 (genuine `server_tool_use` chains, no beta header).
+	/// - `claude-code-20250219` is a client-identification hint with no
+	///   request-shape semantics; the Converse transport has silently dropped
+	///   it for weeks with zero client impact.
+	const LOSSLESS_DROPPABLE_BETAS: &[&str] =
+		&["advanced-tool-use-2025-11-20", "claude-code-20250219"];
+
+	/// Beta values recognized as gating capabilities the native Bedrock
+	/// Messages transport cannot serve. Requests carrying them are rejected
+	/// with a typed error before any AWS invocation — never silently
+	/// degraded, never forwarded to an opaque upstream 400.
+	const UNSUPPORTED_REQUIRED_BETAS: &[&str] = &[
+		// Anthropic-API SSE event granularity; the native transport passes
+		// Bedrock events through verbatim and cannot synthesize it.
+		"fine-grained-tool-streaming-2025-05-14",
+	];
+
+	/// Beta resolution outcome for the native Bedrock Messages transport.
+	#[derive(Debug, Default)]
+	pub struct NativeBedrockBetaResolution {
+		/// Values forwarded in the body-level `anthropic_beta` field.
+		pub kept: Vec<String>,
+		/// Values removed without loss (natively served / client hints).
+		pub dropped_lossless: Vec<String>,
+		/// Unrecognized values removed conservatively. Bedrock `InvokeModel`
+		/// rejects every undocumented body-level `anthropic_beta` value
+		/// outright, and the Converse transport has never forwarded any
+		/// client beta — these clients already operate without them.
+		pub dropped_unknown: Vec<String>,
 	}
 
-	/// Pure core of [`native_beta_resolution`], injectable for tests.
-	pub fn native_beta_resolution_with(
+	/// Resolve client `anthropic-beta` values for the native Bedrock
+	/// transport. Classification per value:
+	/// 1. documented for Bedrock (the
+	///    `AGENTGATEWAY_BEDROCK_ANTHROPIC_BETA_HEADERS` expansion, default =
+	///    the AWS-documented list) → kept;
+	/// 2. [`LOSSLESS_DROPPABLE_BETAS`] → dropped without loss;
+	/// 3. [`UNSUPPORTED_REQUIRED_BETAS`] → `Err` naming the values (typed
+	///    fail-closed rejection);
+	/// 4. anything else → dropped conservatively, surfaced via
+	///    `dropped_unknown` for observability.
+	///
+	/// Replaces the pre-2026-11-03 verbatim forwarding: Bedrock `InvokeModel`
+	/// rejects every undocumented body-level `anthropic_beta` value (observed
+	/// in Production 2026-11-03: `advanced-tool-use-2025-11-20`), so verbatim
+	/// forwarding turned every beta-bearing Claude Code request into an
+	/// upstream 400.
+	pub fn native_bedrock_beta_resolution(
 		values: Vec<String>,
-		explicit_allow_list: bool,
-	) -> (Vec<String>, Vec<String>) {
-		if !explicit_allow_list {
-			return (values, Vec::new());
+	) -> Result<NativeBedrockBetaResolution, Vec<String>> {
+		native_bedrock_beta_resolution_with(values, &ALLOWED_BETA_HEADERS)
+	}
+
+	/// Pure core of [`native_bedrock_beta_resolution`], injectable for tests.
+	pub fn native_bedrock_beta_resolution_with(
+		values: Vec<String>,
+		allowed: &[String],
+	) -> Result<NativeBedrockBetaResolution, Vec<String>> {
+		let mut resolution = NativeBedrockBetaResolution::default();
+		let mut unsupported = Vec::new();
+		for value in values {
+			if allowed.contains(&value) {
+				resolution.kept.push(value);
+			} else if LOSSLESS_DROPPABLE_BETAS.contains(&value.as_str()) {
+				resolution.dropped_lossless.push(value);
+			} else if value.starts_with("tool-search-tool") || value.starts_with("advanced-tool-use") {
+				// Guard (preserved from the pre-2026-11-03 refusal arm): a
+				// Tool Search beta that is neither allow-listed nor
+				// stage-proven droppable is refused — a Tool Search request
+				// must never be silently degraded. New Tool Search beta
+				// versions must be proven on Stage before joining
+				// LOSSLESS_DROPPABLE_BETAS.
+				unsupported.push(value);
+			} else if UNSUPPORTED_REQUIRED_BETAS.contains(&value.as_str()) {
+				unsupported.push(value);
+			} else {
+				resolution.dropped_unknown.push(value);
+			}
 		}
-		let allowed = &*ALLOWED_BETA_HEADERS;
-		values
-			.into_iter()
-			.partition(|value| allowed.iter().any(|feature| feature == value))
+		if unsupported.is_empty() {
+			Ok(resolution)
+		} else {
+			Err(unsupported)
+		}
 	}
 
 	pub fn extract_beta_headers_with_allowed(
