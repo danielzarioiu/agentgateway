@@ -5028,12 +5028,11 @@ async fn count_tokens_bedrock_mantle_maps_geo_profile_to_base_model() {
 	use crate::test_helpers::proxymock::setup_proxy_test;
 	use crate::types::agent::BackendTarget;
 
-	// The provider sits in eu-west-1 (our production gateway Region), which
-	// Opus 5.5's mantle card set does not include: dispatch is only permitted
-	// with an explicit override into a serving Region, so pin us-east-1.
-	let _mantle_region = ScopedMantleRegionEnv::set("us-east-1");
+	// eu-west-1 provider (our production gateway Region): Opus 4.8's mantle
+	// card includes eu-west-1, so its count_tokens rides in-Region mantle —
+	// no environment input, EU residency preserved by construction.
 	let provider = AIProvider::bedrock(bedrock::Provider {
-		model_override: Some(strng::new("global.anthropic.claude-opus-5-5")),
+		model_override: Some(strng::new("global.anthropic.claude-opus-4-8")),
 		region: strng::new("eu-west-1"),
 		guardrail_identifier: None,
 		guardrail_version: None,
@@ -5050,7 +5049,7 @@ async fn count_tokens_bedrock_mantle_maps_geo_profile_to_base_model() {
 		.uri("/v1/messages/count_tokens")
 		.header(::http::header::CONTENT_TYPE, "application/json")
 		.body(Body::from(
-			br#"{"model":"global.anthropic.claude-opus-5-5","messages":[{"role":"user","content":"hello"}]}"#.to_vec(),
+			br#"{"model":"global.anthropic.claude-opus-4-8","messages":[{"role":"user","content":"hello"}]}"#.to_vec(),
 		))
 		.unwrap();
 
@@ -5075,23 +5074,22 @@ async fn count_tokens_bedrock_mantle_maps_geo_profile_to_base_model() {
 	let forwarded_body = forwarded.collect().await.unwrap().to_bytes();
 	let forwarded_json: Value = serde_json::from_slice(&forwarded_body).unwrap();
 	// bedrock-mantle names base model IDs, never geo inference profiles.
-	assert_eq!(forwarded_json["model"], json!("anthropic.claude-opus-5-5"));
+	assert_eq!(forwarded_json["model"], json!("anthropic.claude-opus-4-8"));
 	assert_eq!(forwarded_json["messages"][0]["content"], json!("hello"));
 }
 
 #[tokio::test]
-async fn count_tokens_cris_model_outside_mantle_region_fails_closed_pre_dispatch() {
+async fn count_tokens_opus_5_5_no_eu_mantle_region_fails_closed_pre_dispatch() {
 	use crate::http::auth::BackendInfo;
 	use crate::test_helpers::proxymock::setup_proxy_test;
 	use crate::types::agent::BackendTarget;
 
-	// eu-west-1 provider with no mantle override: Opus 5.5's card set has no
-	// EU Region, so the count_tokens body must never be dispatched anywhere —
-	// the typed client-contract error is produced with ZERO upstream
-	// invocation (the enterprise prompt stays in the gateway). The override
-	// is pinned to another out-of-set Region so the rejection is independent
-	// of the ambient env in the parallel test run.
-	let _mantle_region = ScopedMantleRegionEnv::set("ap-southeast-2");
+	// eu-west-1 provider: Opus 5.5's mantle availability (us-east-1 /
+	// ap-southeast-4 / GovCloud) has no EU Region, and there is deliberately
+	// no cross-region override — the count_tokens body must never be
+	// dispatched anywhere. The typed client-contract error is produced with
+	// ZERO upstream invocation (the enterprise prompt stays in the gateway),
+	// independent of any ambient environment.
 	let provider = AIProvider::bedrock(bedrock::Provider {
 		model_override: Some(strng::new("global.anthropic.claude-opus-5-5")),
 		region: strng::new("eu-west-1"),
@@ -5137,9 +5135,9 @@ async fn count_tokens_sonnet_5_5_has_no_commercial_mantle_region() {
 	use crate::test_helpers::proxymock::setup_proxy_test;
 	use crate::types::agent::BackendTarget;
 
-	// Even with an override into Opus 5.5's serving Region, Sonnet 5.5 has no
-	// commercial mantle surface at all: rejected before dispatch, always.
-	let _mantle_region = ScopedMantleRegionEnv::set("us-east-1");
+	// Sonnet 5.5's mantle availability is GovCloud-only (outside the approved
+	// commercial perimeter entirely): rejected before dispatch, from every
+	// Region, with no environment input.
 	let provider = AIProvider::bedrock(bedrock::Provider {
 		model_override: Some(strng::new("global.anthropic.claude-sonnet-5-5")),
 		region: strng::new("eu-west-1"),
@@ -5300,27 +5298,40 @@ async fn anthropic_count_tokens_mantle_unavailable_and_malformed_never_fabricate
 
 #[test]
 fn count_tokens_bedrock_mantle_setup_routes_the_anthropic_native_path() {
-	// setup_request resolves the Bedrock endpoint per route type: the CRIS-only
-	// Claude 5.5 models ride the Anthropic-native count_tokens surface on
-	// bedrock-mantle, while non-Anthropic models keep the Runtime CountTokens
-	// API path.
-	for (model, expected_path, expects_mantle) in [
+	// setup_request resolves the Bedrock endpoint per route type and provider
+	// region: EU-served CRIS-only Claude models ride the Anthropic-native
+	// count_tokens surface on in-Region bedrock-mantle; models with no legal
+	// surface here (Opus 5.5 has no EU mantle Region) fall through to the
+	// Runtime path shape — the gateway's pre-dispatch typed rejection is what
+	// actually serves them, setup_request staying on Runtime is defense in
+	// depth — and non-Anthropic models keep the Runtime CountTokens API path.
+	for (model, provider_region, expected_path, expects_mantle) in [
+		(
+			"global.anthropic.claude-opus-4-8",
+			"eu-west-1",
+			"/anthropic/v1/messages/count_tokens",
+			true,
+		),
 		(
 			"global.anthropic.claude-opus-5-5",
+			"us-east-1",
 			"/anthropic/v1/messages/count_tokens",
 			true,
 		),
 		(
 			"global.anthropic.claude-sonnet-5-5",
-			"/anthropic/v1/messages/count_tokens",
-			true,
+			"us-east-1",
+			"/model/global.anthropic.claude-sonnet-5-5/count-tokens",
+			false,
 		),
 		(
 			"openai.gpt-6-luna",
+			"us-east-1",
 			"/model/openai.gpt-6-luna/count-tokens",
 			false,
 		),
 	] {
+		let provider = bedrock_provider_with_region(provider_region);
 		let provider = bedrock_provider();
 		let llm_request = LLMRequest {
 			input_tokens: None,
@@ -5359,21 +5370,16 @@ fn count_tokens_bedrock_mantle_setup_routes_the_anthropic_native_path() {
 }
 
 #[test]
-fn count_tokens_bedrock_mantle_signing_region_follows_override() {
-	// Shared env mutex: a raw set/remove here raced the other count-tokens
-	// request-path tests (a concurrent Drop cleared their override mid-flight).
-	let _guard = ScopedMantleRegionEnv::set("us-east-1");
-
-	// Mantle endpoint (Claude model, count-tokens route): the SigV4 signing
-	// region follows the override — the provider itself lives in another
-	// Region, and bedrock-mantle only serves these models In-Region
-	// elsewhere (per model card).
+fn count_tokens_bedrock_mantle_signing_region_is_provider_region() {
+	// Mantle endpoint (EU-served CRIS-only Claude, count-tokens route): the
+	// SigV4 signing region IS the provider's own Region — in-Region mantle is
+	// the only legal path, so host and signature never leave it.
 	let provider = bedrock_provider_with_region("eu-west-1");
 	let llm_request = LLMRequest {
 		input_tokens: None,
 		input_format: InputFormat::CountTokens,
 		cache_convention: CacheTokenConvention::pending(),
-		request_model: "global.anthropic.claude-opus-5-5".into(),
+		request_model: "global.anthropic.claude-opus-4-8".into(),
 		provider: "aws.bedrock".into(),
 		streaming: false,
 		params: Default::default(),
@@ -5405,11 +5411,11 @@ fn count_tokens_bedrock_mantle_signing_region_follows_override() {
 			.extensions()
 			.get::<bedrock::AwsRegion>()
 			.map(|region| region.region.as_str()),
-		Some("us-east-1")
+		Some("eu-west-1")
 	);
 
 	// Runtime endpoint (non-Anthropic model): the signing region stays the
-	// provider's own Region, untouched by the mantle override.
+	// provider's own Region as before.
 	let mut req = crate::http::tests_common::request(
 		"https://bedrock-runtime.eu-west-1.amazonaws.com/v1/messages/count_tokens",
 		http::Method::POST,
@@ -5439,34 +5445,6 @@ fn count_tokens_bedrock_mantle_signing_region_follows_override() {
 			.map(|region| region.region.as_str()),
 		Some("eu-west-1")
 	);
-}
-
-/// Serializes tests that set `AGENTGATEWAY_BEDROCK_MANTLE_REGION`: the
-/// process env is global, so one test's override window must never overlap
-/// another count-tokens request-path test's region resolution.
-static MANTLE_ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Scoped `AGENTGATEWAY_BEDROCK_MANTLE_REGION` override for count-tokens
-/// tests: sets the region and removes it when the test ends, holding the env
-/// mutex so concurrent request-path tests cannot observe the window.
-struct ScopedMantleRegionEnv {
-	_lock: std::sync::MutexGuard<'static, ()>,
-}
-
-impl ScopedMantleRegionEnv {
-	fn set(region: &str) -> Self {
-		let lock = MANTLE_ENV_TEST_MUTEX
-			.lock()
-			.unwrap_or_else(|poisoned| poisoned.into_inner());
-		unsafe { std::env::set_var("AGENTGATEWAY_BEDROCK_MANTLE_REGION", region) };
-		Self { _lock: lock }
-	}
-}
-
-impl Drop for ScopedMantleRegionEnv {
-	fn drop(&mut self) {
-		unsafe { std::env::remove_var("AGENTGATEWAY_BEDROCK_MANTLE_REGION") };
-	}
 }
 
 /// Count-tokens LLMRequest for the mantle response-processing tests: a

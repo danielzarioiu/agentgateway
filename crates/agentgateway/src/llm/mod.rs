@@ -1263,19 +1263,18 @@ impl AIProvider {
 		self.supported_formats(request_model).contains(&format)
 	}
 
-	/// Whether a Bedrock CRIS-only model's Anthropic count-tokens would ride
-	/// bedrock-mantle into a Region its model card does not serve. Such a
-	/// request must fail closed with the typed client-contract error BEFORE
-	/// any AWS invocation — the count_tokens body is enterprise prompt content
-	/// and must never reach a Region that cannot serve the model (R10). All
-	/// non-Bedrock providers and non-CRIS models are unaffected.
-	fn mantle_count_tokens_region_unavailable(&self, request_model: &str) -> bool {
+	/// Whether this model has NO legal Anthropic count-tokens surface from
+	/// this provider (capability resolution `Unsupported`: Runtime denied and
+	/// no in-Region bedrock-mantle availability). Such a request must fail
+	/// closed with the typed client-contract error BEFORE any AWS invocation —
+	/// the count_tokens body is enterprise prompt content and must never reach
+	/// a Region that cannot serve the model (R10), and exact counts must never
+	/// be fabricated. All non-Bedrock providers are unaffected.
+	fn count_tokens_unsupported(&self, request_model: &str) -> bool {
 		match self {
 			AIProvider::Bedrock(provider) => {
-				matches!(
-					provider.resolve_endpoint(RouteType::AnthropicTokenCount, Some(request_model), None),
-					bedrock::BedrockEndpoint::Mantle
-				) && !provider.mantle_count_tokens_permitted(request_model)
+				bedrock::resolve_count_tokens(request_model, provider.region.as_str())
+					== bedrock::CountTokensSurface::Unsupported
 			},
 			_ => false,
 		}
@@ -2249,7 +2248,7 @@ impl AIProvider {
 			.to_string();
 		let use_local = !self
 			.supports_format(custom::ProviderFormat::AnthropicTokenCount, &request_model)
-			|| self.mantle_count_tokens_region_unavailable(&request_model);
+			|| self.count_tokens_unsupported(&request_model);
 		if use_local {
 			let body = serde_json::json!({
 				"type": "error",
