@@ -62,6 +62,44 @@ const MANTLE_SIGNING_SERVICE_NAME: &str = "bedrock-mantle";
 /// Read per call (not cached) so tests and rolling config stay independent.
 const MANTLE_REGION_ENV: &str = "AGENTGATEWAY_BEDROCK_MANTLE_REGION";
 
+/// bedrock-mantle Regions that serve the Anthropic count_tokens API In-Region
+/// for each CRIS-only Claude model (AWS model cards, checked 2026-11-03:
+/// Opus 5.5 — us-east-1 and ap-southeast-4, plus GovCloud; Sonnet 5.5 and
+/// Haiku 5.5 — GovCloud only, no commercial Region). An empty set means the
+/// model has no commercial Mantle surface at all. A count_tokens body is
+/// enterprise prompt content: it must never be dispatched to a Region that
+/// cannot serve the model, so `mantle_count_tokens_permitted` rejects before
+/// any AWS invocation when the resolved mantle Region is outside the model's
+/// set. Models absent from this table are not classified CRIS-only and keep
+/// the Runtime CountTokens API they already work with.
+const MANTLE_COUNT_TOKENS_REGIONS: &[(&str, &[&str])] = &[
+	(
+		"anthropic.claude-opus-5-5",
+		&["us-east-1", "ap-southeast-4"],
+	),
+	("anthropic.claude-sonnet-5-5", &[]),
+	("anthropic.claude-haiku-5-5", &[]),
+];
+
+/// Base model ID (geo/global inference-profile prefix stripped) if the model
+/// is classified CRIS-only by the mantle region table; `None` = unclassified.
+pub fn cris_only_base_model(model_id: &str) -> Option<&'static str> {
+	let base = model_id
+		.split_once('.')
+		.filter(|(_, base)| base.starts_with("anthropic."))
+		.map_or(model_id, |(_, base)| base);
+	MANTLE_COUNT_TOKENS_REGIONS
+		.iter()
+		.find(|(model, _)| *model == base)
+		.map(|(model, _)| *model)
+}
+
+/// Whether the model is classified CRIS-only (its count-tokens surface is
+/// bedrock-mantle only; the Runtime CountTokens API denies it).
+pub fn is_cris_only_model(model_id: &str) -> bool {
+	cris_only_base_model(model_id).is_some()
+}
+
 #[apply(schema!)]
 #[cfg_attr(feature = "schema", schemars(rename = "BedrockProviderConfig"))]
 pub struct Provider {
@@ -114,12 +152,16 @@ impl Provider {
 			// inference profiles such as global.anthropic.claude-*-5-5) have no
 			// Region-specific CountTokens surface there — the Runtime CountTokens
 			// API denies them (AWS model cards). bedrock-mantle serves Anthropic's
-			// native count_tokens for every Claude model, so Anthropic count-tokens
-			// routes there regardless of the CHAT transport (NativeMessages forces
-			// Runtime for chat only; count-tokens is transport-independent). An
-			// explicit RuntimeOnly pin stays honored.
+			// native count_tokens for them, regardless of the CHAT transport
+			// (NativeMessages forces Runtime for chat only; count-tokens is
+			// transport-independent). Only models the region table classifies as
+			// CRIS-only take the mantle arm; every other model keeps the Runtime
+			// CountTokens API it already works with. An explicit RuntimeOnly pin
+			// stays honored. Region entitlement is enforced at request time by
+			// `mantle_count_tokens_permitted` — a body is never sent to a Region
+			// that cannot serve the model.
 			RT::AnthropicTokenCount
-				if model_id.is_some_and(|m| self.is_anthropic_model(m))
+				if model_id.is_some_and(is_cris_only_model)
 					&& !matches!(
 						self.endpoint_preference,
 						BedrockEndpointPreference::RuntimeOnly
@@ -282,6 +324,25 @@ impl Provider {
 			.unwrap_or_else(|| self.region.as_str().to_owned())
 	}
 
+	/// Whether the resolved mantle Region may receive this CRIS-only model's
+	/// count_tokens body. The override is per-gateway, so it MUST NOT quietly
+	/// retarget models whose Mantle availability differs (Sonnet/Haiku 5.5 have
+	/// no commercial Mantle Region at all): a model is servable only when the
+	/// resolved Region is in its card set. Rejecting here keeps enterprise
+	/// prompt content inside permitted Regions (R10) and fails closed with the
+	/// client-contract typed error instead of an upstream denial.
+	pub fn mantle_count_tokens_permitted(&self, model_id: &str) -> bool {
+		let Some(base) = cris_only_base_model(model_id) else {
+			// Unclassified models do not take the mantle count-tokens arm.
+			return true;
+		};
+		let (_, regions) = MANTLE_COUNT_TOKENS_REGIONS
+			.iter()
+			.find(|(model, _)| *model == base)
+			.expect("cris_only_base_model returned a table entry");
+		regions.contains(&self.mantle_region().as_str())
+	}
+
 	pub fn get_host(&self, route_type: super::RouteType, endpoint: BedrockEndpoint) -> Strng {
 		// Rerank always uses the agent-runtime host, independent of endpoint choice.
 		if matches!(route_type, super::RouteType::Rerank) {
@@ -320,17 +381,27 @@ mod tests {
 		p
 	}
 
+	/// Serializes every test that reads or writes `AGENTGATEWAY_BEDROCK_MANTLE_REGION`
+	/// (or asserts a mantle host/region default): the process env is global, so a
+	/// guard's window must never overlap another test's ambient read. Tests that
+	/// only assert env-independent resolution do not take this lock.
+	static MANTLE_ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 	/// Scoped test guard for `AGENTGATEWAY_BEDROCK_MANTLE_REGION`: sets the
 	/// override and removes it on drop, so parallel tests observe the default
-	/// again as soon as the guarded test ends.
-	struct MantleRegionOverrideGuard;
+	/// again as soon as the guarded test ends. Holds the env mutex for its
+	/// lifetime, so concurrent ambient readers cannot observe the window.
+	struct MantleRegionOverrideGuard {
+		_lock: std::sync::MutexGuard<'static, ()>,
+	}
 
 	impl MantleRegionOverrideGuard {
 		fn set(region: &str) -> Self {
-			// Same single-test scoped pattern as the tool-search env guard:
-			// the override lives only for the duration of this test.
+			let lock = MANTLE_ENV_TEST_MUTEX
+				.lock()
+				.unwrap_or_else(|poisoned| poisoned.into_inner());
 			unsafe { std::env::set_var(MANTLE_REGION_ENV, region) };
-			Self
+			Self { _lock: lock }
 		}
 	}
 
@@ -338,6 +409,14 @@ mod tests {
 		fn drop(&mut self) {
 			unsafe { std::env::remove_var(MANTLE_REGION_ENV) };
 		}
+	}
+
+	/// Takes the env mutex WITHOUT setting an override, for tests that assert
+	/// mantle region defaults against the ambient environment.
+	fn lock_mantle_env() -> std::sync::MutexGuard<'static, ()> {
+		MANTLE_ENV_TEST_MUTEX
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
 	}
 
 	#[test]
@@ -374,16 +453,17 @@ mod tests {
 
 	#[test]
 	fn resolve_endpoint_routes_anthropic_count_tokens_to_mantle() {
-		// CRIS-only Claude models (geo inference profiles) have no CountTokens
-		// surface on bedrock-runtime; the Anthropic-native count_tokens API on
+		// CRIS-only Claude models (the 5.5 family — geo/global inference
+		// profiles or bare base IDs) have no CountTokens surface on
+		// bedrock-runtime; the Anthropic-native count_tokens API on
 		// bedrock-mantle is the documented surface for them.
 		let p = provider(BedrockEndpointPreference::RuntimePreferred);
 		for model in [
 			"global.anthropic.claude-opus-5-5",
+			"eu.anthropic.claude-opus-5-5",
+			"anthropic.claude-opus-5-5",
 			"global.anthropic.claude-sonnet-5-5",
-			"eu.anthropic.claude-sonnet-4-6",
-			"us.anthropic.claude-haiku-4-5-20251001-v1:0",
-			"anthropic.claude-3-5-sonnet-20241022-v2:0",
+			"global.anthropic.claude-haiku-5-5",
 		] {
 			assert_eq!(
 				p.resolve_endpoint(RouteType::AnthropicTokenCount, Some(model), None),
@@ -391,6 +471,29 @@ mod tests {
 				"model={model}"
 			);
 		}
+		// Unclassified Claude models keep the Runtime CountTokens API they
+		// already work with — the mantle arm is reserved for the CRIS-only
+		// family the region table knows about.
+		for model in [
+			"eu.anthropic.claude-sonnet-4-6",
+			"us.anthropic.claude-haiku-4-5-20251001-v1:0",
+			"anthropic.claude-3-5-sonnet-20241022-v2:0",
+		] {
+			assert_eq!(
+				p.resolve_endpoint(RouteType::AnthropicTokenCount, Some(model), None),
+				BedrockEndpoint::Runtime,
+				"model={model}"
+			);
+		}
+		// An explicit RuntimeOnly pin keeps CRIS-only models on Runtime too.
+		assert_eq!(
+			provider(BedrockEndpointPreference::RuntimeOnly).resolve_endpoint(
+				RouteType::AnthropicTokenCount,
+				Some("global.anthropic.claude-opus-5-5"),
+				None
+			),
+			BedrockEndpoint::Runtime
+		);
 		// Count-tokens rides Mantle even when the chat transport is native:
 		// the transport selector forces Runtime for chat only.
 		let native = native_provider(BedrockEndpointPreference::RuntimePreferred);
@@ -430,13 +533,51 @@ mod tests {
 	}
 
 	#[test]
+	fn mantle_count_tokens_permitted_requires_card_region() {
+		let p = provider(BedrockEndpointPreference::RuntimePreferred);
+		// Provider region us-east-1 (test default) is in Opus 5.5's mantle
+		// card set, so its count_tokens body may go there — geo/global
+		// profile IDs and the bare base ID classify identically. Sonnet and
+		// Haiku 5.5 have NO commercial mantle region at all. Unclassified
+		// models never take the mantle arm (gate vacuously permissive).
+		{
+			let _env = lock_mantle_env();
+			assert!(p.mantle_count_tokens_permitted("global.anthropic.claude-opus-5-5"));
+			assert!(p.mantle_count_tokens_permitted("anthropic.claude-opus-5-5"));
+			assert!(!p.mantle_count_tokens_permitted("global.anthropic.claude-sonnet-5-5"));
+			assert!(!p.mantle_count_tokens_permitted("anthropic.claude-haiku-5-5"));
+			assert!(p.mantle_count_tokens_permitted("eu.anthropic.claude-sonnet-4-6"));
+		}
+		// ap-southeast-4 is Opus 5.5's other commercial mantle region.
+		{
+			let _guard = MantleRegionOverrideGuard::set("ap-southeast-4");
+			assert!(p.mantle_count_tokens_permitted("global.anthropic.claude-opus-5-5"));
+		}
+		// The per-gateway override can never widen a model's own card set:
+		// even an in-set override for Opus leaves Sonnet 5.5 unservable.
+		{
+			let _guard = MantleRegionOverrideGuard::set("us-east-1");
+			assert!(!p.mantle_count_tokens_permitted("global.anthropic.claude-sonnet-5-5"));
+		}
+		// A Region outside Opus 5.5's card set (our production eu-west-1
+		// gateway) must not receive the body: fail closed pre-dispatch.
+		{
+			let _guard = MantleRegionOverrideGuard::set("eu-west-1");
+			assert!(!p.mantle_count_tokens_permitted("global.anthropic.claude-opus-5-5"));
+		}
+	}
+
+	#[test]
 	fn mantle_host_and_signing_region_follow_override() {
 		let p = provider(BedrockEndpointPreference::RuntimePreferred);
 		// Default: the mantle host lives in the provider's own region…
-		assert_eq!(
-			p.get_host(RouteType::Messages, BedrockEndpoint::Mantle),
-			"bedrock-mantle.us-east-1.api.aws"
-		);
+		{
+			let _env = lock_mantle_env();
+			assert_eq!(
+				p.get_host(RouteType::Messages, BedrockEndpoint::Mantle),
+				"bedrock-mantle.us-east-1.api.aws"
+			);
+		}
 		// …unless the mantle region override points at a region that
 		// actually serves the model In-Region (per-model card). The
 		// override drives the host AND the SigV4 signing region (see
@@ -884,6 +1025,8 @@ mod tests {
 	#[test]
 	fn anthropic_count_tokens_follows_the_endpoint() {
 		// Runtime uses the Bedrock CountTokens API; Mantle uses Anthropic's native count_tokens.
+		// The host assertion reads the ambient mantle region: hold the env lock.
+		let _env = lock_mantle_env();
 		let runtime = provider(BedrockEndpointPreference::RuntimeOnly);
 		let runtime_ep = runtime.resolve_endpoint(RouteType::AnthropicTokenCount, Some("m"), None);
 		assert_eq!(runtime_ep, BedrockEndpoint::Runtime);

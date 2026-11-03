@@ -5028,6 +5028,10 @@ async fn count_tokens_bedrock_mantle_maps_geo_profile_to_base_model() {
 	use crate::test_helpers::proxymock::setup_proxy_test;
 	use crate::types::agent::BackendTarget;
 
+	// The provider sits in eu-west-1 (our production gateway Region), which
+	// Opus 5.5's mantle card set does not include: dispatch is only permitted
+	// with an explicit override into a serving Region, so pin us-east-1.
+	let _mantle_region = ScopedMantleRegionEnv::set("us-east-1");
 	let provider = AIProvider::bedrock(bedrock::Provider {
 		model_override: Some(strng::new("global.anthropic.claude-opus-5-5")),
 		region: strng::new("eu-west-1"),
@@ -5046,20 +5050,25 @@ async fn count_tokens_bedrock_mantle_maps_geo_profile_to_base_model() {
 		.uri("/v1/messages/count_tokens")
 		.header(::http::header::CONTENT_TYPE, "application/json")
 		.body(Body::from(
-			br#"{"model":"claude-opus-5-5","messages":[{"role":"user","content":"hello"}]}"#.to_vec(),
+			br#"{"model":"global.anthropic.claude-opus-5-5","messages":[{"role":"user","content":"hello"}]}"#.to_vec(),
 		))
 		.unwrap();
 
-	let RequestResult::Success {
-		request: forwarded,
-		upstream_route_type,
-		..
-	} = provider
+	let result = provider
 		.process_count_tokens_request(&backend_info, req, None, &mut None, None)
 		.await
-		.expect("mantle count_tokens request should process")
-	else {
-		panic!("expected forwarded request");
+		.expect("mantle count_tokens request should process");
+	let (forwarded, upstream_route_type) = match result {
+		RequestResult::Success {
+			request,
+			upstream_route_type,
+			..
+		} => (request, upstream_route_type),
+		RequestResult::Rejected(resp) => {
+			let b = resp.into_body().collect().await.unwrap().to_bytes();
+			panic!("rejected: {}", String::from_utf8_lossy(&b));
+		},
+		other => panic!("other variant: {other:?}"),
 	};
 
 	assert_eq!(upstream_route_type, RouteType::AnthropicTokenCount);
@@ -5068,6 +5077,100 @@ async fn count_tokens_bedrock_mantle_maps_geo_profile_to_base_model() {
 	// bedrock-mantle names base model IDs, never geo inference profiles.
 	assert_eq!(forwarded_json["model"], json!("anthropic.claude-opus-5-5"));
 	assert_eq!(forwarded_json["messages"][0]["content"], json!("hello"));
+}
+
+#[tokio::test]
+async fn count_tokens_cris_model_outside_mantle_region_fails_closed_pre_dispatch() {
+	use crate::http::auth::BackendInfo;
+	use crate::test_helpers::proxymock::setup_proxy_test;
+	use crate::types::agent::BackendTarget;
+
+	// eu-west-1 provider with no mantle override: Opus 5.5's card set has no
+	// EU Region, so the count_tokens body must never be dispatched anywhere —
+	// the typed client-contract error is produced with ZERO upstream
+	// invocation (the enterprise prompt stays in the gateway). The override
+	// is pinned to another out-of-set Region so the rejection is independent
+	// of the ambient env in the parallel test run.
+	let _mantle_region = ScopedMantleRegionEnv::set("ap-southeast-2");
+	let provider = AIProvider::bedrock(bedrock::Provider {
+		model_override: Some(strng::new("global.anthropic.claude-opus-5-5")),
+		region: strng::new("eu-west-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: Default::default(),
+		transport: Default::default(),
+	});
+	let inputs = setup_proxy_test("{}").unwrap().pi;
+	let backend_info = BackendInfo {
+		target: BackendTarget::Invalid,
+		call_target: Target::from(("bedrock-runtime.eu-west-1.amazonaws.com", 443)),
+		inputs,
+	};
+	let req = ::http::Request::builder()
+		.uri("/v1/messages/count_tokens")
+		.header(::http::header::CONTENT_TYPE, "application/json")
+		.body(Body::from(
+			br#"{"model":"global.anthropic.claude-opus-5-5","messages":[{"role":"user","content":"hello"}]}"#.to_vec(),
+		))
+		.unwrap();
+	let RequestResult::Rejected(resp) = provider
+		.process_count_tokens_request(&backend_info, req, None, &mut None, None)
+		.await
+		.expect("count_tokens request should process")
+	else {
+		panic!("expected typed pre-dispatch rejection");
+	};
+	assert_eq!(resp.status(), ::http::StatusCode::BAD_REQUEST);
+	let body = resp.into_body().collect().await.unwrap().to_bytes();
+	let error: Value = serde_json::from_slice(&body).unwrap();
+	assert_eq!(error["type"], "error");
+	assert_eq!(error["error"]["type"], "invalid_request_error");
+	assert!(
+		error.get("input_tokens").is_none_or(|v| v.is_null()),
+		"no fabricated count"
+	);
+}
+
+#[tokio::test]
+async fn count_tokens_sonnet_5_5_has_no_commercial_mantle_region() {
+	use crate::http::auth::BackendInfo;
+	use crate::test_helpers::proxymock::setup_proxy_test;
+	use crate::types::agent::BackendTarget;
+
+	// Even with an override into Opus 5.5's serving Region, Sonnet 5.5 has no
+	// commercial mantle surface at all: rejected before dispatch, always.
+	let _mantle_region = ScopedMantleRegionEnv::set("us-east-1");
+	let provider = AIProvider::bedrock(bedrock::Provider {
+		model_override: Some(strng::new("global.anthropic.claude-sonnet-5-5")),
+		region: strng::new("eu-west-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+		endpoint_preference: Default::default(),
+		transport: Default::default(),
+	});
+	let inputs = setup_proxy_test("{}").unwrap().pi;
+	let backend_info = BackendInfo {
+		target: BackendTarget::Invalid,
+		call_target: Target::from(("bedrock-runtime.eu-west-1.amazonaws.com", 443)),
+		inputs,
+	};
+	let req = ::http::Request::builder()
+		.uri("/v1/messages/count_tokens")
+		.header(::http::header::CONTENT_TYPE, "application/json")
+		.body(Body::from(
+			br#"{"model":"global.anthropic.claude-sonnet-5-5","messages":[{"role":"user","content":"hello"}]}"#.to_vec(),
+		))
+		.unwrap();
+	let RequestResult::Rejected(resp) = provider
+		.process_count_tokens_request(&backend_info, req, None, &mut None, None)
+		.await
+		.expect("count_tokens request should process")
+	else {
+		panic!("expected typed pre-dispatch rejection");
+	};
+	assert_eq!(resp.status(), ::http::StatusCode::BAD_REQUEST);
+	let body = resp.into_body().collect().await.unwrap().to_bytes();
+	assert!(String::from_utf8_lossy(&body).contains("not supported"));
 }
 
 #[tokio::test]
@@ -5257,14 +5360,9 @@ fn count_tokens_bedrock_mantle_setup_routes_the_anthropic_native_path() {
 
 #[test]
 fn count_tokens_bedrock_mantle_signing_region_follows_override() {
-	struct MantleRegionGuard;
-	impl Drop for MantleRegionGuard {
-		fn drop(&mut self) {
-			unsafe { std::env::remove_var("AGENTGATEWAY_BEDROCK_MANTLE_REGION") };
-		}
-	}
-	unsafe { std::env::set_var("AGENTGATEWAY_BEDROCK_MANTLE_REGION", "us-east-1") };
-	let _guard = MantleRegionGuard;
+	// Shared env mutex: a raw set/remove here raced the other count-tokens
+	// request-path tests (a concurrent Drop cleared their override mid-flight).
+	let _guard = ScopedMantleRegionEnv::set("us-east-1");
 
 	// Mantle endpoint (Claude model, count-tokens route): the SigV4 signing
 	// region follows the override — the provider itself lives in another
@@ -5341,6 +5439,57 @@ fn count_tokens_bedrock_mantle_signing_region_follows_override() {
 			.map(|region| region.region.as_str()),
 		Some("eu-west-1")
 	);
+}
+
+/// Serializes tests that set `AGENTGATEWAY_BEDROCK_MANTLE_REGION`: the
+/// process env is global, so one test's override window must never overlap
+/// another count-tokens request-path test's region resolution.
+static MANTLE_ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Scoped `AGENTGATEWAY_BEDROCK_MANTLE_REGION` override for count-tokens
+/// tests: sets the region and removes it when the test ends, holding the env
+/// mutex so concurrent request-path tests cannot observe the window.
+struct ScopedMantleRegionEnv {
+	_lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ScopedMantleRegionEnv {
+	fn set(region: &str) -> Self {
+		let lock = MANTLE_ENV_TEST_MUTEX
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		unsafe { std::env::set_var("AGENTGATEWAY_BEDROCK_MANTLE_REGION", region) };
+		Self { _lock: lock }
+	}
+}
+
+impl Drop for ScopedMantleRegionEnv {
+	fn drop(&mut self) {
+		unsafe { std::env::remove_var("AGENTGATEWAY_BEDROCK_MANTLE_REGION") };
+	}
+}
+
+/// Count-tokens LLMRequest for the mantle response-processing tests: a
+/// CRIS-only Claude model (the family whose count-tokens surface is
+/// bedrock-mantle only), named by its geo inference profile.
+fn count_tokens_request() -> LLMRequest {
+	LLMRequest {
+		input_tokens: None,
+		input_format: InputFormat::CountTokens,
+		cache_convention: CacheTokenConvention::pending(),
+		request_model: "global.anthropic.claude-opus-5-5".into(),
+		provider: "aws.bedrock".into(),
+		streaming: false,
+		params: Default::default(),
+		prompt: None,
+		provider_state: None,
+		safeguards: None,
+		transport_hints: Default::default(),
+	}
+}
+
+fn bedrock_provider() -> AIProvider {
+	bedrock_provider_with_region("us-east-1")
 }
 
 fn bedrock_provider_with_region(region: &str) -> AIProvider {
