@@ -311,6 +311,20 @@ fn classify_upstream_error_message(message: &str) -> Option<(&'static str, Strin
 			format!("max={},found={}", &caps[1], &caps[2]),
 		));
 	}
+	// Captured live 2026-11-03 (stage rc3-cacheonly window, haiku/sonnet native
+	// legs): AWS validates marker ordering and rejects 1h-after-5m with this
+	// fixed sentence, wrapped in an inner JSON envelope inside error.message.
+	// The core is a fixed provider-schema sentence — only the surrounding
+	// wrapper varies. No parameters: the class name is the whole diagnosis.
+	static TTL_ORDERING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+		regex::Regex::new(
+			r"a ttl='1h' cache_control block must not come after a ttl='5m' cache_control block",
+		)
+		.unwrap()
+	});
+	if TTL_ORDERING.is_match(message) {
+		return Some(("cache_ttl_ordering_violation", "-".to_string()));
+	}
 	None
 }
 

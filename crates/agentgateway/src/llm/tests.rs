@@ -4997,6 +4997,23 @@ fn upstream_client_error_diagnostic_classifies_known_template() {
 	assert_eq!(d.params, "max=4,found=5");
 	// No free-form text field exists on the diagnostic at all.
 	assert!(!format!("{d:?}").contains("maximum of"));
+
+	// Second live-captured template (2026-11-03 stage rc3-cacheonly window):
+	// the ttl-ordering rejection arrives with the sentence wrapped in an inner
+	// JSON envelope inside error.message. Class-only, no parameters, and the
+	// wrapped sentence text never reaches any emitted field.
+	let b = upstream_client_error_diagnostic(
+		br#"{"type":"error","error":{"type":"invalid_request_error","message":"{\"message\":\"messages.0.content.1.cache_control.ttl: a ttl='1h' cache_control block must not come after a ttl='5m' cache_control block. Note that blocks are processed in the following order: `tools`, `system`, `messages`.\"}"}}"#,
+	);
+	let d2 = b.expect("wrapped ttl-ordering envelope extracts");
+	assert_eq!(d2.error_type, "invalid_request_error");
+	assert_eq!(d2.class, Some("cache_ttl_ordering_violation"));
+	assert_eq!(d2.params, "-");
+	assert!(
+		!format!("{d2:?}").contains("cache_control block must not come after"),
+		"the raw sentence must not appear on the diagnostic: {:?}",
+		d2
+	);
 }
 
 #[test]
